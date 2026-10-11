@@ -1,0 +1,68 @@
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: vet, test, build
+        id: build
+        run: |
+          mkdir -p out
+          rc=0
+          {
+            echo "== go version"; go version
+            echo "== gofmt"; test -z "$(gofmt -l .)" || { gofmt -l .; rc=1; }
+            echo "== go vet"; go vet ./... || rc=1
+            echo "== go test"; go test -count=1 -v ./... || rc=1
+            echo "== go build"
+            go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::7}" -o out/LocalSyncExt.exe . || rc=1
+            echo "== result rc=$rc"
+          } > out/build.log 2>&1
+          cat out/build.log
+          cp LocalSyncExt.ini out/LocalSyncExt.ini
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: publish log to branch build-logs
+        if: always()
+        run: |
+          git config --global user.name "build-bot"
+          git config --global user.email "build-bot@users.noreply.github.com"
+          d="$(mktemp -d)"
+          cp out/build.log "$d/build.log"
+          echo "run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} rc=${{ steps.build.outputs.rc }}" > "$d/info.txt"
+          cd "$d"
+          git init -q
+          git checkout -q -b build-logs
+          git add .
+          git commit -q -m "log for ${GITHUB_SHA::7}"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" build-logs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalSyncExt-win
+          path: |
+            out/LocalSyncExt.exe
+            out/LocalSyncExt.ini
+            out/build.log
+
+      - name: fail if build had errors
+        if: steps.build.outputs.rc != '0'
+        run: exit 1
