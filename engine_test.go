@@ -55,7 +55,6 @@ func setup(t *testing.T, ini string, dirs ...string) (*Engine, *Config) {
 	return NewEngine(cfg, filepath.Join(root, "state"), false, io.Discard), cfg
 }
 
-
 func TestTwoWayBasic(t *testing.T) {
 	en, cfg := setup(t, "[R1]\nscan=0\n{R}/a\n{R}/b\n{R}/c\n")
 	r := cfg.Rules[0]
