@@ -41,6 +41,11 @@ type Rule struct {
 	MaxDeletePct int
 	DeleteExtra  bool
 	Enabled      bool
+	Marker       bool         // маркер-файл в папках (по умолчанию да)
+	NoMarker     map[int]bool // пути (с 0), для которых маркер отключён
+	Watch        bool         // мгновенное слежение за изменениями
+	ScanSet      bool         // scan задан явно
+	Debounce     int          // мс, пауза накопления событий
 	Endpoints    []*Endpoint
 
 	Masks    []string
@@ -58,7 +63,8 @@ func newRule(name string) *Rule {
 	return &Rule{
 		Name: name, Mode: "twoway", Conflict: "auto", Notify: true,
 		TrashDays: 30, Scan: 60, Recursive: true, MaxDeletePct: 50,
-		DeleteExtra: true, Enabled: true,
+		DeleteExtra: true, Enabled: true, Marker: true, Watch: true, Debounce: 1500,
+		NoMarker: map[int]bool{},
 	}
 }
 
@@ -101,7 +107,7 @@ func (r *Rule) setOption(k, v string, cfg *Config) {
 			return
 		}
 		r.Conflict = v
-	case "notify", "recursive", "enabled", "deleteextra":
+	case "notify", "recursive", "enabled", "deleteextra", "marker", "watch":
 		b, ok := parseBool(v)
 		if !ok {
 			r.fail("%s=%q: нужно 1/0", k, v)
@@ -116,7 +122,27 @@ func (r *Rule) setOption(k, v string, cfg *Config) {
 			r.Enabled = b
 		case "deleteextra":
 			r.DeleteExtra = b
+		case "marker":
+			r.Marker = b
+		case "watch":
+			r.Watch = b
 		}
+	case "nomarker":
+		for _, p := range strings.FieldsFunc(v, func(c rune) bool { return c == ',' || c == ';' || c == ' ' }) {
+			n, err := strconv.Atoi(p)
+			if err != nil || n < 1 {
+				r.fail("nomarker=%q: нужны номера путей правила, начиная с 1 (например 2,3)", v)
+				return
+			}
+			r.NoMarker[n-1] = true
+		}
+	case "debounce":
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 100 || n > 60000 {
+			r.fail("debounce=%q: нужно число миллисекунд 100..60000", v)
+			return
+		}
+		r.Debounce = n
 	case "ignore":
 		for _, p := range strings.Split(v, ";") {
 			if p = strings.ToLower(strings.TrimSpace(p)); p != "" {
@@ -140,7 +166,7 @@ func (r *Rule) setOption(k, v string, cfg *Config) {
 			r.fail("scan=%q: нужно число секунд >= 0", v)
 			return
 		}
-		r.Scan = n
+		r.Scan, r.ScanSet = n, true
 	case "maxdeletepercent":
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > 100 {
@@ -208,6 +234,16 @@ func ParseConfig(path string) (*Config, error) {
 			continue
 		}
 		cur.setOption(k, v, cfg)
+	}
+	for _, r := range cfg.Rules {
+		if !r.ScanSet {
+			// при наблюдателе полное сканирование нужно лишь как страховка
+			if r.Watch {
+				r.Scan = 900
+			} else {
+				r.Scan = 60
+			}
+		}
 	}
 	return cfg, sc.Err()
 }
@@ -305,6 +341,11 @@ func (c *Config) Validate() {
 		if r.Mode == "oneway" && r.Master >= len(r.Endpoints) {
 			r.fail("master=%d, но путей только %d", r.Master+1, len(r.Endpoints))
 		}
+		for i := range r.NoMarker {
+			if i >= len(r.Endpoints) {
+				r.fail("nomarker: пути №%d нет в правиле", i+1)
+			}
+		}
 		r.prepare()
 	}
 	for i, ra := range c.Rules {
@@ -341,4 +382,19 @@ func (c *Config) Validate() {
 func safeName(name string) string {
 	s := regexp.MustCompile(`[^\p{L}\p{N}_-]+`).ReplaceAllString(name, "_")
 	return fmt.Sprintf("%s-%08x", s, crc32.ChecksumIEEE([]byte(strings.ToLower(name))))
+}
+
+func (r *Rule) useMarker(i int) bool { return r.Marker && !r.NoMarker[i] }
+
+// sig — отпечаток настроек правила: по нему при перечитывании конфига
+// понимаем, какие правила изменились и требуют перезапуска.
+func (r *Rule) sig() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s|%s|%d|%s|%t|%q|%d|%d|%t|%d|%t|%t|%t|%v|%d", r.Name, r.Mode, r.Master, r.Conflict,
+		r.Notify, r.Ignore, r.TrashDays, r.Scan, r.Recursive, r.MaxDeletePct, r.DeleteExtra,
+		r.Marker, r.Watch, r.NoMarker, r.Debounce)
+	for _, e := range r.Endpoints {
+		sb.WriteString("|" + e.Raw)
+	}
+	return sb.String()
 }

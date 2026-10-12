@@ -18,10 +18,18 @@ type Base struct {
 type State struct {
 	IDs  map[string]string `json:"ids"`  // путь -> id маркера (защита от отключённого/подменённого диска)
 	Base map[string]Base   `json:"base"` // ключ файла -> согласованная версия
+	Vols map[string]string `json:"vols"` // путь -> серийный номер тома (Windows)
+
+	dirty bool
 }
 
+func (s *State) setID(k, v string)        { s.IDs[k] = v; s.dirty = true }
+func (s *State) setVol(k, v string)       { s.Vols[k] = v; s.dirty = true }
+func (s *State) setBase(k string, b Base) { s.Base[k] = b; s.dirty = true }
+func (s *State) delBase(k string)         { delete(s.Base, k); s.dirty = true }
+
 func loadState(path string) (*State, error) {
-	st := &State{IDs: map[string]string{}, Base: map[string]Base{}}
+	st := &State{IDs: map[string]string{}, Base: map[string]Base{}, Vols: map[string]string{}}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return st, nil
@@ -39,6 +47,9 @@ func loadState(path string) (*State, error) {
 	if st.Base == nil {
 		st.Base = map[string]Base{}
 	}
+	if st.Vols == nil {
+		st.Vols = map[string]string{}
+	}
 	return st, nil
 }
 
@@ -54,5 +65,9 @@ func (s *State) save(path string) error {
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	s.dirty = false
+	return nil
 }

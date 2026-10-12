@@ -3,6 +3,7 @@ name: build-windows
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -27,13 +28,15 @@ jobs:
         run: |
           mkdir -p out
           rc=0
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then VER="${GITHUB_REF_NAME}"; else VER="dev-${GITHUB_SHA::7}"; fi
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
           {
-            echo "== go version"; go version
+            echo "== version $VER"; go version
             echo "== gofmt (только информация)"; gofmt -l . || true
             echo "== go vet"; go vet ./... || rc=1
             echo "== go test"; go test -count=1 -v ./... || rc=1
             echo "== go build"
-            go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::7}" -o out/LocalSyncExt.exe . || rc=1
+            go build -trimpath -ldflags "-s -w -X main.version=$VER" -o out/LocalSyncExt.exe . || rc=1
             echo "== result rc=$rc"
           } > out/build.log 2>&1
           cat out/build.log
@@ -47,7 +50,7 @@ jobs:
           git config --global user.email "build-bot@users.noreply.github.com"
           d="$(mktemp -d)"
           cp out/build.log "$d/build.log"
-          echo "run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} rc=${{ steps.build.outputs.rc }}" > "$d/info.txt"
+          echo "run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} ver=${{ steps.build.outputs.ver }} rc=${{ steps.build.outputs.rc }}" > "$d/info.txt"
           cd "$d"
           git init -q
           git checkout -q -b build-logs
@@ -57,7 +60,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: LocalSyncExt-win
+          name: LocalSyncExt-win-${{ steps.build.outputs.ver }}
           path: |
             out/LocalSyncExt.exe
             out/LocalSyncExt.ini
@@ -66,3 +69,15 @@ jobs:
       - name: fail if build had errors
         if: steps.build.outputs.rc != '0'
         run: exit 1
+
+      - name: create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${{ steps.build.outputs.ver }}"
+          cp out/LocalSyncExt.exe "out/LocalSyncExt-${VER}-win-amd64.exe"
+          awk -v t="## ${VER}" 'index($0,t)==1{p=1;print;next} /^## /{p=0} p' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then echo "Релиз ${VER}" > notes.md; fi
+          gh release create "$VER" "out/LocalSyncExt-${VER}-win-amd64.exe" out/LocalSyncExt.ini \
+            --title "LocalSyncExt ${VER}" --notes-file notes.md

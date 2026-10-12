@@ -13,6 +13,15 @@ import (
 
 var version = "dev"
 
+func loadConfig(path string) (*Config, error) {
+	cfg, err := ParseConfig(path)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Validate()
+	return cfg, nil
+}
+
 func main() {
 	cfgPath := flag.String("config", "", "путь к ini (по умолчанию LocalSyncExt.ini рядом с exe)")
 	once := flag.Bool("once", false, "один проход и выход")
@@ -30,12 +39,11 @@ func main() {
 	if *cfgPath == "" {
 		*cfgPath = filepath.Join(exeDir, "LocalSyncExt.ini")
 	}
-	cfg, err := ParseConfig(*cfgPath)
+	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "не удалось прочитать конфиг:", err)
 		os.Exit(2)
 	}
-	cfg.Validate()
 
 	var w io.Writer = os.Stderr
 	logPath := cfg.Settings["logfile"]
@@ -55,16 +63,7 @@ func main() {
 		stateDir = filepath.Join(exeDir, "state")
 	}
 	en := NewEngine(cfg, stateDir, *dry, w)
-	for _, s := range cfg.Warnings {
-		en.logf("config", "WARN", "%s", s)
-	}
-	bad := false
-	for _, r := range cfg.Rules {
-		if r.Err != "" {
-			en.logf(r.Name, "ERROR", "ошибка конфигурации: %s", r.Err)
-			bad = true
-		}
-	}
+	bad := en.report(cfg)
 	if *check {
 		if bad {
 			os.Exit(1)
@@ -81,7 +80,10 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	en.logf("main", "INFO", "LocalSyncExt %s запущен, правил: %d", version, len(cfg.Rules))
-	en.Run(ctx)
+	en.logf("main", "INFO", "LocalSyncExt %s запущен, правил: %d. Изменения %s применяются на лету", version, len(cfg.Rules), filepath.Base(*cfgPath))
+	en.Start(ctx)
+	go en.WatchConfig(ctx, *cfgPath, loadConfig)
+	<-ctx.Done()
+	en.Stop()
 	en.logf("main", "INFO", "остановлен")
 }
