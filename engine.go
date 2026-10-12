@@ -411,46 +411,46 @@ func (en *Engine) ruleLoop(ctx context.Context, r *Rule, rt *ruleRT) {
 	needFull := true
 	nextFull := time.Now()
 	var raws []rawEv
-	var retry time.Duration
+	var retryAt time.Time
+	run := true
 
 	for {
 		if lost.Swap(false) {
-			needFull = true
+			needFull, run = true, true
 		}
-		if needFull || len(raws) > 0 || retry >= 0 {
+		if run {
 			batch := raws
 			raws = nil
 			wasFull := needFull
-			var err error
-			retry, err = en.pass(r, rt, needFull, batch, false)
-			needFull = false
+			retry, err := en.pass(r, rt, needFull, batch, false)
+			needFull, run = false, false
 			if wasFull {
 				nextFull = time.Now().Add(en.scanEvery(r, &watchBad))
 			}
 			if err != nil && retry <= 0 {
 				retry = 30 * time.Second
 			}
-			if retry == 0 {
-				retry = -1
+			retryAt = time.Time{}
+			if retry > 0 {
+				retryAt = time.Now().Add(retry)
 			}
 		}
 
 		var timers []*time.Timer
 		mk := func(d time.Duration) <-chan time.Time {
+			if d < 0 {
+				d = 0
+			}
 			t := time.NewTimer(d)
 			timers = append(timers, t)
 			return t.C
 		}
 		var debC, fullC, retryC, flushC <-chan time.Time
 		if r.Scan > 0 || watchBad.Load() {
-			d := time.Until(nextFull)
-			if d < 0 {
-				d = 0
-			}
-			fullC = mk(d)
+			fullC = mk(time.Until(nextFull))
 		}
-		if retry > 0 {
-			retryC = mk(retry)
+		if !retryAt.IsZero() {
+			retryC = mk(time.Until(retryAt))
 		}
 		if rt.st != nil && rt.st.dirty {
 			flushC = mk(stateFlush)
@@ -472,15 +472,16 @@ func (en *Engine) ruleLoop(ctx context.Context, r *Rule, rt *ruleRT) {
 					debC = mk(debounce)
 				}
 			case <-debC:
+				run = true
 				break wait
 			case <-fullC:
-				needFull = true
+				needFull, run = true, true
 				break wait
 			case <-retryC:
-				retry = -1
+				run = true
 				break wait
 			case <-rt.trigger:
-				needFull = true
+				needFull, run = true, true
 				break wait
 			case <-flushC:
 				flushC = nil
@@ -490,10 +491,6 @@ func (en *Engine) ruleLoop(ctx context.Context, r *Rule, rt *ruleRT) {
 			}
 		}
 		stopAll()
-		if retry > 0 && !needFull {
-			// событие/таймер пришли раньше повтора — повтор выполнится вместе с ними
-			retry = -1
-		}
 	}
 }
 
