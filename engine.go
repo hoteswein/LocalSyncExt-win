@@ -374,11 +374,16 @@ func (en *Engine) startWatchers(ctx context.Context, r *Rule, emit func(ep int, 
 					return
 				}
 				bad.Store(true)
-				en.logf(r.Name, "WARN", "слежение за %s прервалось: %v; работаю по таймеру, повтор через 15 с", dir, err)
+				wait := 15 * time.Second
+				if attempts <= 5 { // папка могла ещё не существовать при первом запуске
+					wait = time.Second
+				} else if attempts == 6 {
+					en.logf(r.Name, "WARN", "слежение за %s не работает: %v; работаю по таймеру, повтор каждые 15 с", dir, err)
+				}
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(15 * time.Second):
+				case <-time.After(wait):
 				}
 			}
 		}(i, e.Dir)

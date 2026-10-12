@@ -4,10 +4,10 @@ package main
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -45,7 +45,13 @@ func TestEndToEndWatcher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	en := NewEngine(cfg, filepath.Join(root, "state"), false, io.Discard)
+	var logbuf syncBuf
+	en := NewEngine(cfg, filepath.Join(root, "state"), false, &logbuf)
+	defer func() {
+		if t.Failed() {
+			t.Log("журнал движка:\n" + logbuf.String())
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	en.Start(ctx)
 	defer func() { cancel(); en.Stop() }()
@@ -60,4 +66,21 @@ func TestEndToEndWatcher(t *testing.T) {
 
 	os.Remove(filepath.Join(root, "a", "live.txt"))
 	waitFor(t, 15*time.Second, func() bool { return !exists(filepath.Join(root, "b", "live.txt")) }, "удаление по событию")
+}
+
+type syncBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
