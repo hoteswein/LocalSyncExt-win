@@ -46,6 +46,10 @@ type Rule struct {
 	Watch        bool         // мгновенное слежение за изменениями
 	ScanSet      bool         // scan задан явно
 	Debounce     int          // мс, пауза накопления событий
+	TrashPlace   string       // folder | work | абсолютный путь ("" — взять из [Settings])
+	TempMode     string       // prefix | work ("" — из [Settings])
+	DirectKB     int          // файлы не больше этого размера пишутся сразу, без временного файла (-1 — из [Settings])
+	workDir      string
 	Endpoints    []*Endpoint
 
 	Masks    []string
@@ -54,6 +58,7 @@ type Rule struct {
 }
 
 type Config struct {
+	WorkDir  string
 	Settings map[string]string
 	Rules    []*Rule
 	Warnings []string
@@ -64,7 +69,7 @@ func newRule(name string) *Rule {
 		Name: name, Mode: "twoway", Conflict: "auto", Notify: true,
 		TrashDays: 30, Scan: 60, Recursive: true, MaxDeletePct: 50,
 		DeleteExtra: true, Enabled: true, Marker: true, Watch: true, Debounce: 1500,
-		NoMarker: map[int]bool{},
+		NoMarker: map[int]bool{}, DirectKB: -1,
 	}
 }
 
@@ -136,6 +141,26 @@ func (r *Rule) setOption(k, v string, cfg *Config) {
 			}
 			r.NoMarker[n-1] = true
 		}
+	case "trash":
+		if v != "folder" && v != "work" && !pathLineRe.MatchString(v) {
+			r.fail("trash=%q: допустимо folder, work или полный путь", v)
+			return
+		}
+		r.TrashPlace = v
+	case "temp":
+		v = strings.ToLower(v)
+		if v != "prefix" && v != "work" {
+			r.fail("temp=%q: допустимо prefix или work", v)
+			return
+		}
+		r.TempMode = v
+	case "directbelow":
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			r.fail("directbelow=%q: нужно число КБ >= 0 (0 — всегда через временный файл)", v)
+			return
+		}
+		r.DirectKB = n
 	case "debounce":
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 100 || n > 60000 {
@@ -235,6 +260,7 @@ func ParseConfig(path string) (*Config, error) {
 		}
 		cur.setOption(k, v, cfg)
 	}
+	cfg.applyDefaults()
 	for _, r := range cfg.Rules {
 		if !r.ScanSet {
 			// при наблюдателе полное сканирование нужно лишь как страховка
@@ -341,6 +367,7 @@ func (c *Config) Validate() {
 		if r.Mode == "oneway" && r.Master >= len(r.Endpoints) {
 			r.fail("master=%d, но путей только %d", r.Master+1, len(r.Endpoints))
 		}
+		r.checkWorkPlaces(c)
 		for i := range r.NoMarker {
 			if i >= len(r.Endpoints) {
 				r.fail("nomarker: пути №%d нет в правиле", i+1)
@@ -384,6 +411,91 @@ func safeName(name string) string {
 	return fmt.Sprintf("%s-%08x", s, crc32.ChecksumIEEE([]byte(strings.ToLower(name))))
 }
 
+// applyDefaults подставляет значения из [Settings] и встроенные умолчания.
+func (c *Config) applyDefaults() {
+	if wd := c.Settings["workdir"]; wd != "" {
+		c.WorkDir = wd
+	} else {
+		exe, _ := os.Executable()
+		c.WorkDir = filepath.Join(filepath.Dir(exe), "work")
+	}
+	gTrash, gTemp, gDirect := "folder", "prefix", 1024
+	if v := c.Settings["trash"]; v != "" {
+		if v == "folder" || v == "work" || pathLineRe.MatchString(v) {
+			gTrash = v
+		} else {
+			c.Warnings = append(c.Warnings, fmt.Sprintf("[Settings] trash=%q не понят, использую folder", v))
+		}
+	}
+	if v := strings.ToLower(c.Settings["temp"]); v != "" {
+		if v == "prefix" || v == "work" {
+			gTemp = v
+		} else {
+			c.Warnings = append(c.Warnings, fmt.Sprintf("[Settings] temp=%q не понят, использую prefix", v))
+		}
+	}
+	if v := c.Settings["directbelow"]; v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			gDirect = n
+		} else {
+			c.Warnings = append(c.Warnings, fmt.Sprintf("[Settings] directbelow=%q не понят, использую %d", v, gDirect))
+		}
+	}
+	for _, r := range c.Rules {
+		r.workDir = c.WorkDir
+		if r.TrashPlace == "" {
+			r.TrashPlace = gTrash
+		}
+		if r.TempMode == "" {
+			r.TempMode = gTemp
+		}
+		if r.DirectKB < 0 {
+			r.DirectKB = gDirect
+		}
+	}
+}
+
+// trashRoot — где лежит корзина для пути №i (с 0).
+func (r *Rule) trashRoot(i int) string {
+	switch r.TrashPlace {
+	case "folder", "":
+		return filepath.Join(r.Endpoints[i].Dir, trashDir)
+	case "work":
+		return filepath.Join(r.workDir, "trash", safeName(r.Name), fmt.Sprintf("ep%d", i+1))
+	}
+	return filepath.Join(r.TrashPlace, safeName(r.Name), fmt.Sprintf("ep%d", i+1))
+}
+
+// checkWorkPlaces: корзина/временные файлы вне папок не должны попадать внутрь синхронизируемых путей.
+func (r *Rule) checkWorkPlaces(c *Config) {
+	var roots []string
+	if r.TrashPlace != "folder" && r.TrashPlace != "" {
+		if r.TrashPlace == "work" {
+			roots = append(roots, r.workDir)
+		} else {
+			roots = append(roots, r.TrashPlace)
+		}
+	}
+	if r.TempMode == "work" {
+		roots = append(roots, r.workDir)
+	}
+	for _, root := range roots {
+		lr := lowerClean(root)
+		for _, other := range c.Rules {
+			for _, e := range other.Endpoints {
+				ep := lowerClean(filepath.Dir(e.Raw))
+				if !strings.ContainsAny(filepath.Base(e.Raw), "*?") {
+					ep = lowerClean(e.Raw)
+				}
+				if under(lr, ep) {
+					r.fail("рабочая папка %s находится внутри синхронизируемого пути %s — задайте другой WorkDir или trash", root, e.Raw)
+					return
+				}
+			}
+		}
+	}
+}
+
 func (r *Rule) useMarker(i int) bool { return r.Marker && !r.NoMarker[i] }
 
 // sig — отпечаток настроек правила: по нему при перечитывании конфига
@@ -393,6 +505,7 @@ func (r *Rule) sig() string {
 	fmt.Fprintf(&sb, "%s|%s|%d|%s|%t|%q|%d|%d|%t|%d|%t|%t|%t|%v|%d", r.Name, r.Mode, r.Master, r.Conflict,
 		r.Notify, r.Ignore, r.TrashDays, r.Scan, r.Recursive, r.MaxDeletePct, r.DeleteExtra,
 		r.Marker, r.Watch, r.NoMarker, r.Debounce)
+	fmt.Fprintf(&sb, "|%s|%s|%d|%s", r.TrashPlace, r.TempMode, r.DirectKB, r.workDir)
 	for _, e := range r.Endpoints {
 		sb.WriteString("|" + e.Raw)
 	}

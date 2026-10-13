@@ -663,8 +663,11 @@ func (en *Engine) pass(r *Rule, rt *ruleRT, full bool, raws []rawEv, force bool)
 	for k, v := range failed {
 		rt.pend[k] = v
 	}
-	if r.TrashDays > 0 && !en.dry && time.Since(rt.lastCleanup) > time.Hour {
-		en.cleanTrash(r)
+	if !en.dry && time.Since(rt.lastCleanup) > time.Hour {
+		if r.TrashDays > 0 {
+			en.cleanTrash(r)
+		}
+		cleanWorkTmp(r)
 		rt.lastCleanup = time.Now()
 	}
 	if len(jobs) > 0 || ps.failed > 0 {
@@ -778,9 +781,18 @@ func matchAny(patterns []string, lname string) bool {
 	return false
 }
 
+var tempNameRe = regexp.MustCompile(`(?i)^(localsyncext-\d{8}-\d{6}-|\.lsx-tmp-)`)
+
 func ignored(r *Rule, name string) bool {
 	l := strings.ToLower(name)
-	return matchAny(defaultIgnore, l) || matchAny(r.Ignore, l)
+	return matchAny(defaultIgnore, l) || matchAny(r.Ignore, l) || tempNameRe.MatchString(name)
+}
+
+// removeStaleTemp удаляет «осиротевшие» временные файлы программы старше суток.
+func removeStaleTemp(p string, d fs.DirEntry) {
+	if info, err := d.Info(); err == nil && time.Since(info.ModTime()) > 24*time.Hour {
+		_ = os.Remove(p)
+	}
 }
 
 func ignoredPath(r *Rule, rel string) bool {
@@ -838,6 +850,10 @@ func scanEndpoint(r *Rule, e *Endpoint) (*epCache, error) {
 			}
 			rel, _ := filepath.Rel(root, p)
 			c.dirs[relKey(rel)] = filepath.ToSlash(rel)
+			return nil
+		}
+		if d.Type().IsRegular() && tempNameRe.MatchString(name) {
+			removeStaleTemp(p, d)
 			return nil
 		}
 		if ignored(r, name) || !d.Type().IsRegular() {
@@ -1256,7 +1272,7 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 				en.notify(r, "Конфликт файлов", filepath.Base(dst)+" — сохранена конфликтная копия")
 			}
 			en.logf(r.Name, "INFO", "копирую %s -> %s", src, dst)
-			if err := en.copyFile(r, src, wi, e, dst); err != nil {
+			if err := en.copyFile(r, src, wi, c.dst, dst); err != nil {
 				ok = false
 				if errors.Is(err, errSourceChanged) {
 					ps.pending++
@@ -1281,7 +1297,7 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 		p := r.abs(r.Endpoints[i], fi.Rel)
 		en.logf(r.Name, "INFO", "удаляю %s", p)
 		if !en.dry {
-			if err := en.removeOld(r, r.Endpoints[i], p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if _, err := en.removeOld(r, i, p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				en.logf(r.Name, "ERROR", "удаление %s: %v", p, err)
 				ps.failed++
 				ok = false
@@ -1301,22 +1317,54 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 	return ok
 }
 
-var tmpCounter uint64
+func sameVolume(a, b string) bool {
+	return strings.EqualFold(filepath.VolumeName(a), filepath.VolumeName(b))
+}
 
-func (en *Engine) copyFile(r *Rule, srcPath string, wi FInfo, e *Endpoint, dstPath string) error {
+// createTemp создаёт временный файл для большого файла: рядом с целевым с приставкой
+// LocalSyncExt-ДАТА-ВРЕМЯ- (переименование атомарно) или в рабочей папке (temp=work, только на том же томе).
+func createTemp(r *Rule, dstPath string) (*os.File, string, error) {
+	dir, base := filepath.Split(dstPath)
+	if r.TempMode == "work" && sameVolume(r.workDir, dir) {
+		dir = filepath.Join(r.workDir, "tmp")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, "", err
+		}
+	}
+	stamp := time.Now().Format("20060102-150405")
+	for n := 0; n < 1000; n++ {
+		name := fmt.Sprintf("LocalSyncExt-%s-%s", stamp, base)
+		if n > 0 {
+			name = fmt.Sprintf("LocalSyncExt-%s-%d-%s", stamp, n, base)
+		}
+		p := filepath.Join(dir, name)
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			return f, p, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, "", err
+		}
+	}
+	return nil, "", errors.New("не удалось подобрать имя временного файла")
+}
+
+func (en *Engine) copyFile(r *Rule, srcPath string, wi FInfo, di int, dstPath string) error {
 	if en.dry {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return err
 	}
+	if r.DirectKB > 0 && wi.Size <= int64(r.DirectKB)*1024 {
+		return en.copyDirect(r, srcPath, wi, di, dstPath)
+	}
 	in, err := os.Open(srcPath)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	tmp := filepath.Join(filepath.Dir(dstPath), fmt.Sprintf(".lsx-tmp-%d-%d", os.Getpid(), atomic.AddUint64(&tmpCounter, 1)))
-	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	out, tmp, err := createTemp(r, dstPath)
 	if err != nil {
 		return err
 	}
@@ -1342,7 +1390,7 @@ func (en *Engine) copyFile(r *Rule, srcPath string, wi FInfo, e *Endpoint, dstPa
 		return err
 	}
 	if _, err := os.Lstat(dstPath); err == nil {
-		if err := en.removeOld(r, e, dstPath); err != nil {
+		if _, err := en.removeOld(r, di, dstPath); err != nil {
 			os.Remove(tmp)
 			return err
 		}
@@ -1354,32 +1402,108 @@ func (en *Engine) copyFile(r *Rule, srcPath string, wi FInfo, e *Endpoint, dstPa
 	return nil
 }
 
-// removeOld: в корзину или удалить, в зависимости от TrashDays правила.
-func (en *Engine) removeOld(r *Rule, e *Endpoint, p string) error {
-	if r.TrashDays < 0 {
-		return os.Remove(p)
+// copyDirect — малые файлы: читаем в память и пишем сразу в целевой файл, без временного.
+func (en *Engine) copyDirect(r *Rule, srcPath string, wi FInfo, di int, dstPath string) error {
+	data, err := os.ReadFile(srcPath)
+	if err != nil {
+		return err
 	}
+	fi, err := os.Stat(srcPath)
+	if err != nil || fi.Size() != wi.Size || fi.ModTime().UnixNano() != wi.MTime || int64(len(data)) != wi.Size {
+		return errSourceChanged
+	}
+	mt := time.Unix(0, wi.MTime)
+	trashed := ""
+	if _, lerr := os.Lstat(dstPath); lerr == nil {
+		if r.TrashDays < 0 {
+			if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+				return err
+			}
+			return os.Chtimes(dstPath, mt, mt)
+		}
+		if trashed, err = en.removeOld(r, di, dstPath); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+		_ = os.Remove(dstPath)
+		if trashed != "" {
+			_ = os.Rename(trashed, dstPath) // вернуть прежнюю версию
+		}
+		return err
+	}
+	return os.Chtimes(dstPath, mt, mt)
+}
+
+// moveFile переносит файл; если Rename невозможен (другой том) — копирует и удаляет исходный.
+func moveFile(src, dst string) error {
+	rerr := os.Rename(src, dst)
+	if rerr == nil {
+		return nil
+	}
+	fi, err := os.Stat(src)
+	if err != nil {
+		return rerr
+	}
+	return copyThenRemove(src, dst, fi)
+}
+
+func copyThenRemove(src, dst string, fi fs.FileInfo) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, in)
+	if err == nil {
+		err = out.Sync()
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chtimes(dst, fi.ModTime(), fi.ModTime())
+	}
+	if err != nil {
+		os.Remove(dst)
+		return err
+	}
+	in.Close()
+	return os.Remove(src)
+}
+
+// removeOld: в корзину (путь возвращается) или удалить, в зависимости от TrashDays правила.
+func (en *Engine) removeOld(r *Rule, i int, p string) (string, error) {
+	if r.TrashDays < 0 {
+		return "", os.Remove(p)
+	}
+	e := r.Endpoints[i]
 	rel := filepath.Base(p)
 	if !r.FileMode {
 		if x, err := filepath.Rel(e.Dir, p); err == nil {
 			rel = x
 		}
 	}
+	root := r.trashRoot(i)
 	dir, base := filepath.Split(rel)
 	ext := filepath.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
 	stamp := time.Now().Format("20060102-150405")
-	dst := filepath.Join(e.Dir, trashDir, dir, fmt.Sprintf("%s~%s%s", stem, stamp, ext))
+	dst := filepath.Join(root, dir, fmt.Sprintf("%s~%s%s", stem, stamp, ext))
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
+		return "", err
 	}
-	for i := 1; ; i++ {
+	for n := 1; ; n++ {
 		if _, err := os.Lstat(dst); errors.Is(err, fs.ErrNotExist) {
 			break
 		}
-		dst = filepath.Join(e.Dir, trashDir, dir, fmt.Sprintf("%s~%s-%d%s", stem, stamp, i, ext))
+		dst = filepath.Join(root, dir, fmt.Sprintf("%s~%s-%d%s", stem, stamp, n, ext))
 	}
-	return os.Rename(p, dst)
+	return dst, moveFile(p, dst)
 }
 
 var trashStampRe = regexp.MustCompile(`~(\d{8}-\d{6})`)
@@ -1387,8 +1511,8 @@ var trashStampRe = regexp.MustCompile(`~(\d{8}-\d{6})`)
 func (en *Engine) cleanTrash(r *Rule) {
 	cutoff := time.Now().Add(-time.Duration(r.TrashDays) * 24 * time.Hour)
 	seen := map[string]bool{}
-	for _, e := range r.Endpoints {
-		root := filepath.Join(e.Dir, trashDir)
+	for i := range r.Endpoints {
+		root := r.trashRoot(i)
 		if seen[strings.ToLower(root)] {
 			continue
 		}
@@ -1411,8 +1535,21 @@ func (en *Engine) cleanTrash(r *Rule) {
 			}
 			return nil
 		})
-		for i := len(dirs) - 1; i > 0; i-- {
-			_ = os.Remove(dirs[i]) // удалится, только если пуста
+		for k := len(dirs) - 1; k > 0; k-- {
+			_ = os.Remove(dirs[k]) // удалится, только если пуста
 		}
 	}
+}
+
+// cleanWorkTmp удаляет осиротевшие временные файлы в рабочей папке (старше суток).
+func cleanWorkTmp(r *Rule) {
+	if r.TempMode != "work" || r.workDir == "" {
+		return
+	}
+	_ = filepath.WalkDir(filepath.Join(r.workDir, "tmp"), func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			removeStaleTemp(p, d)
+		}
+		return nil
+	})
 }
