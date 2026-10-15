@@ -35,8 +35,12 @@ jobs:
             echo "== gofmt (только информация)"; gofmt -l . || true
             echo "== go vet"; go vet ./... || rc=1
             echo "== go test"; go test -count=1 -v ./... || rc=1
-            echo "== go build"
-            go build -trimpath -ldflags "-s -w -X main.version=$VER" -o out/LocalSyncExt.exe . || rc=1
+            echo "== resources (иконка, манифест)"
+            go install github.com/akavel/rsrc@v0.10.2 && "$(go env GOPATH)/bin/rsrc" -ico assets/app.ico -manifest assets/app.manifest -arch amd64 -o rsrc_windows_amd64.syso || echo "WARN: ресурсы не встроены"
+            echo "== go build (GUI, трей, без консоли)"
+            go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$VER -X main.guiBuild=1" -o out/LocalSyncExt.exe . || rc=1
+            echo "== go build (CLI, консоль)"
+            go build -trimpath -ldflags "-s -w -X main.version=$VER" -o out/LocalSyncExt-cli.exe . || rc=1
             echo "== result rc=$rc"
           } > out/build.log 2>&1
           cat out/build.log
@@ -63,6 +67,7 @@ jobs:
           name: LocalSyncExt-win-${{ steps.build.outputs.ver }}
           path: |
             out/LocalSyncExt.exe
+            out/LocalSyncExt-cli.exe
             out/LocalSyncExt.ini
             out/build.log
 
@@ -77,7 +82,8 @@ jobs:
         run: |
           VER="${{ steps.build.outputs.ver }}"
           cp out/LocalSyncExt.exe "out/LocalSyncExt-${VER}-win-amd64.exe"
+          cp out/LocalSyncExt-cli.exe "out/LocalSyncExt-cli-${VER}-win-amd64.exe"
           awk -v t="## ${VER}" 'index($0,t)==1{p=1;print;next} /^## /{p=0} p' CHANGELOG.md > notes.md
           if [ ! -s notes.md ]; then echo "Релиз ${VER}" > notes.md; fi
-          gh release create "$VER" "out/LocalSyncExt-${VER}-win-amd64.exe" out/LocalSyncExt.ini \
+          gh release create "$VER" "out/LocalSyncExt-${VER}-win-amd64.exe" "out/LocalSyncExt-cli-${VER}-win-amd64.exe" out/LocalSyncExt.ini \
             --title "LocalSyncExt ${VER}" --notes-file notes.md

@@ -68,6 +68,7 @@ type ruleRT struct {
 	lastErr string
 	lastRun time.Time
 
+	paused      atomic.Bool
 	lastCleanup time.Time
 	lastSave    time.Time
 	notified    map[string]bool
@@ -160,6 +161,9 @@ func (en *Engine) Statuses() []RuleStatus {
 			st, msg, last = rt.status, rt.lastErr, rt.lastRun
 			rt.smu.Unlock()
 		}
+		if rt := en.rt[r.Name]; rt != nil && rt.paused.Load() && st != "syncing" {
+			st = "paused"
+		}
 		if r.Err != "" {
 			st, msg = "config-error", r.Err
 		} else if !r.Enabled {
@@ -168,6 +172,93 @@ func (en *Engine) Statuses() []RuleStatus {
 		out = append(out, RuleStatus{r.Name, st, msg, last})
 	}
 	return out
+}
+
+// SetPaused ставит правило на паузу или снимает её (после снятия — полное сканирование).
+func (en *Engine) SetPaused(rule string, p bool) {
+	en.mu.Lock()
+	rt := en.rt[rule]
+	en.mu.Unlock()
+	if rt == nil {
+		return
+	}
+	rt.paused.Store(p)
+	if p {
+		rt.smu.Lock()
+		if rt.status != "syncing" {
+			rt.status = "paused"
+		}
+		rt.smu.Unlock()
+		en.logf(rule, "INFO", "пауза")
+		return
+	}
+	en.logf(rule, "INFO", "пауза снята")
+	select {
+	case rt.trigger <- struct{}{}:
+	default:
+	}
+}
+
+func (en *Engine) ruleNames() []string {
+	en.mu.Lock()
+	defer en.mu.Unlock()
+	var names []string
+	for name := range en.rt {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// PauseAll — пауза/продолжение для всех запущенных правил.
+func (en *Engine) PauseAll(p bool) {
+	for _, n := range en.ruleNames() {
+		en.SetPaused(n, p)
+	}
+}
+
+func (en *Engine) IsPaused(rule string) bool {
+	en.mu.Lock()
+	defer en.mu.Unlock()
+	rt := en.rt[rule]
+	return rt != nil && rt.paused.Load()
+}
+
+// AllPaused: есть запущенные правила и все они на паузе.
+func (en *Engine) AllPaused() bool {
+	en.mu.Lock()
+	defer en.mu.Unlock()
+	if len(en.rt) == 0 {
+		return false
+	}
+	for _, rt := range en.rt {
+		if !rt.paused.Load() {
+			return false
+		}
+	}
+	return true
+}
+
+// Busy: хотя бы одно правило сейчас синхронизирует (для анимации значка).
+func (en *Engine) Busy() bool {
+	en.mu.Lock()
+	defer en.mu.Unlock()
+	for _, rt := range en.rt {
+		rt.smu.Lock()
+		b := rt.status == "syncing"
+		rt.smu.Unlock()
+		if b {
+			return true
+		}
+	}
+	return false
+}
+
+// TriggerAll — «синхронизировать всё сейчас».
+func (en *Engine) TriggerAll() {
+	for _, n := range en.ruleNames() {
+		en.Trigger(n)
+	}
 }
 
 // Trigger — «синхронизировать сейчас» (полное сканирование).
@@ -423,6 +514,15 @@ func (en *Engine) ruleLoop(ctx context.Context, r *Rule, rt *ruleRT) {
 		if lost.Swap(false) {
 			needFull, run = true, true
 		}
+		if run && rt.paused.Load() {
+			raws, needFull, run = nil, true, false
+			retryAt = time.Time{}
+			rt.smu.Lock()
+			if rt.status != "syncing" {
+				rt.status = "paused"
+			}
+			rt.smu.Unlock()
+		}
 		if run {
 			batch := raws
 			raws = nil
@@ -472,6 +572,10 @@ func (en *Engine) ruleLoop(ctx context.Context, r *Rule, rt *ruleRT) {
 				stopAll()
 				return
 			case ev := <-evCh:
+				if rt.paused.Load() {
+					needFull = true // события на паузе не копим: после паузы будет полное сканирование
+					break
+				}
 				raws = append(raws, ev)
 				if debC == nil {
 					debC = mk(debounce)

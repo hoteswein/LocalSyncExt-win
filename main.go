@@ -9,9 +9,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 var version = "dev"
+
+// guiBuild = "1" в сборке без консольного окна (-H=windowsgui): по умолчанию работает значок в трее.
+var guiBuild = ""
 
 func loadConfig(path string) (*Config, error) {
 	cfg, err := ParseConfig(path)
@@ -22,16 +26,41 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// tee пишет в обе цели и не падает, если первой (консоли) нет.
+type tee struct{ console, file io.Writer }
+
+func (t tee) Write(p []byte) (int, error) {
+	_, _ = t.console.Write(p)
+	return t.file.Write(p)
+}
+
 func main() {
 	cfgPath := flag.String("config", "", "путь к ini (по умолчанию LocalSyncExt.ini рядом с exe)")
 	once := flag.Bool("once", false, "один проход и выход")
 	dry := flag.Bool("dry-run", false, "только показать, что будет сделано")
 	check := flag.Bool("check", false, "проверить конфиг и выйти")
 	showVer := flag.Bool("version", false, "версия")
+	trayFlag := flag.Bool("tray", false, "работать со значком в трее (в версии без консоли включено всегда)")
 	flag.Parse()
+
+	isGUI := guiBuild == "1"
+	oneShot := *once || *check || *showVer
+	if isGUI && oneShot {
+		attachConsole() // версия без консоли: вывод в окно, из которого запущена
+	}
 	if *showVer {
 		fmt.Println("LocalSyncExt", version)
 		return
+	}
+	useTray := (isGUI || *trayFlag) && !oneShot
+
+	fatal := func(code int, format string, a ...any) {
+		msg := fmt.Sprintf(format, a...)
+		fmt.Fprintln(os.Stderr, msg)
+		if isGUI && !oneShot {
+			showError(msg)
+		}
+		os.Exit(code)
 	}
 
 	exe, _ := os.Executable()
@@ -41,8 +70,15 @@ func main() {
 	}
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "не удалось прочитать конфиг:", err)
-		os.Exit(2)
+		fatal(2, "Не удалось прочитать конфиг %s:\n%v", *cfgPath, err)
+	}
+
+	if !oneShot {
+		ok, release := acquireInstance(*cfgPath)
+		if !ok {
+			fatal(0, "LocalSyncExt уже запущен с этим конфигом.")
+		}
+		defer release()
 	}
 
 	var w io.Writer = os.Stderr
@@ -55,7 +91,7 @@ func main() {
 	}
 	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
 		defer f.Close()
-		w = io.MultiWriter(os.Stderr, f)
+		w = tee{os.Stderr, f}
 	}
 
 	stateDir := cfg.Settings["statedir"]
@@ -78,12 +114,60 @@ func main() {
 		}
 		return
 	}
+
+	// Уведомления: [Settings] Notifications=1|0, переключатель в меню трея запоминается в state\ui.json.
+	nt := newNotifier(5*time.Second, trayBalloon)
+	notifOn := true
+	if b, ok := parseBool(cfg.Settings["notifications"]); ok {
+		notifOn = b
+	}
+	if u := loadUIState(stateDir); u.Notifications != nil {
+		notifOn = *u.Notifications
+	}
+	nt.enabled.Store(notifOn && useTray)
+	en.OnNotify = nt.Push
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	en.logf("main", "INFO", "LocalSyncExt %s запущен, правил: %d. Изменения %s применяются на лету", version, len(cfg.Rules), filepath.Base(*cfgPath))
 	en.Start(ctx)
 	go en.WatchConfig(ctx, *cfgPath, loadConfig)
-	<-ctx.Done()
+
+	if useTray {
+		tc := &trayCtx{
+			en: en, version: version, logPath: logPath, iniPath: *cfgPath, stateDir: stateDir, exePath: exe,
+			click:    parseAction(cfg.Settings["trayclick"], actStatus),
+			dblClick: parseAction(cfg.Settings["traydoubleclick"], actSyncNow),
+			notif:    nt,
+			quit:     stop,
+			reload: func() {
+				c, err := loadConfig(*cfgPath)
+				if err != nil {
+					en.logf("config", "ERROR", "не удалось перечитать конфиг: %v", err)
+					return
+				}
+				en.logf("config", "INFO", "конфиг перечитан по запросу")
+				en.report(c)
+				en.Apply(c)
+			},
+		}
+		go func() {
+			<-ctx.Done()
+			stopTray()
+		}()
+		if err := runTray(tc); err != nil {
+			en.logf("tray", "ERROR", "значок в трее не запущен: %v", err)
+			if isGUI {
+				stop()
+				en.Stop()
+				fatal(1, "Не удалось создать значок в трее: %v", err)
+			}
+			<-ctx.Done() // консольная версия продолжает работать без значка
+		}
+		stop()
+	} else {
+		<-ctx.Done()
+	}
 	en.Stop()
 	en.logf("main", "INFO", "остановлен")
 }
