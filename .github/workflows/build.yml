@@ -41,6 +41,11 @@ jobs:
             go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$VER -X main.guiBuild=1" -o out/LocalSyncExt.exe . || rc=1
             echo "== go build (CLI, консоль)"
             go build -trimpath -ldflags "-s -w -X main.version=$VER" -o out/LocalSyncExt-cli.exe . || rc=1
+            echo "== smoke: запуск собранных exe"
+            ./out/LocalSyncExt-cli.exe -version || rc=1
+            ./out/LocalSyncExt-cli.exe -check -config LocalSyncExt.ini || rc=1
+            ./out/LocalSyncExt.exe -version > out/gui-version.txt 2>&1 || rc=1
+            echo "GUI exe -version: $(cat out/gui-version.txt)"
             echo "== result rc=$rc"
           } > out/build.log 2>&1
           cat out/build.log
