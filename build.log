@@ -1,0 +1,80 @@
+== version v0.4.0
+go version go1.22.12 windows/amd64
+== gofmt (только информация)
+== go vet
+== go test
+=== RUN   TestIncrementalEvents
+--- PASS: TestIncrementalEvents (2.24s)
+=== RUN   TestMarkerOff
+--- PASS: TestMarkerOff (0.01s)
+=== RUN   TestMarkerAllOff
+--- PASS: TestMarkerAllOff (0.00s)
+=== RUN   TestConfigDefaults
+--- PASS: TestConfigDefaults (0.00s)
+=== RUN   TestHotReload
+--- PASS: TestHotReload (4.03s)
+=== RUN   TestTrashInWorkDir
+--- PASS: TestTrashInWorkDir (0.01s)
+=== RUN   TestLargeFileViaTemp
+--- PASS: TestLargeFileViaTemp (0.21s)
+=== RUN   TestDirectOverwriteKeepsOldInTrash
+--- PASS: TestDirectOverwriteKeepsOldInTrash (0.01s)
+=== RUN   TestStaleTempCleanup
+--- PASS: TestStaleTempCleanup (0.01s)
+=== RUN   TestWorkDirInsideEndpoint
+--- PASS: TestWorkDirInsideEndpoint (0.00s)
+=== RUN   TestMoveFallbackCopy
+--- PASS: TestMoveFallbackCopy (0.01s)
+=== RUN   TestTwoWayBasic
+--- PASS: TestTwoWayBasic (0.02s)
+=== RUN   TestConflict
+--- PASS: TestConflict (0.01s)
+=== RUN   TestOfflineProtection
+--- PASS: TestOfflineProtection (0.02s)
+=== RUN   TestMassDeleteProtection
+--- PASS: TestMassDeleteProtection (0.02s)
+=== RUN   TestOneWay
+--- PASS: TestOneWay (0.01s)
+=== RUN   TestNoTrash
+--- PASS: TestNoTrash (0.01s)
+=== RUN   TestMask
+--- PASS: TestMask (0.01s)
+=== RUN   TestSingleFiles
+--- PASS: TestSingleFiles (0.01s)
+=== RUN   TestOverlapValidation
+--- PASS: TestOverlapValidation (0.00s)
+=== RUN   TestIconImageFormat
+--- PASS: TestIconImageFormat (0.00s)
+=== RUN   TestEmbeddedIconSets
+--- PASS: TestEmbeddedIconSets (0.00s)
+=== RUN   TestComputeState
+--- PASS: TestComputeState (0.00s)
+=== RUN   TestActionsAndTexts
+--- PASS: TestActionsAndTexts (0.00s)
+=== RUN   TestNotifierThrottle
+--- PASS: TestNotifierThrottle (0.24s)
+=== RUN   TestUIStateRoundTrip
+--- PASS: TestUIStateRoundTrip (0.00s)
+=== RUN   TestPauseResume
+--- PASS: TestPauseResume (2.81s)
+=== RUN   TestWin32StructSizes
+--- PASS: TestWin32StructSizes (0.00s)
+=== RUN   TestIconsAcceptedByWindows
+--- PASS: TestIconsAcceptedByWindows (0.01s)
+=== RUN   TestAutostartCommand
+--- PASS: TestAutostartCommand (0.00s)
+=== RUN   TestWatchDirEvents
+--- PASS: TestWatchDirEvents (0.30s)
+=== RUN   TestEndToEndWatcher
+--- PASS: TestEndToEndWatcher (8.34s)
+PASS
+ok  	localsyncext	18.365s
+== resources (иконка, манифест)
+go: downloading github.com/akavel/rsrc v0.10.2
+== go build (GUI, трей, без консоли)
+== go build (CLI, консоль)
+== smoke: запуск собранных exe
+LocalSyncExt v0.4.0
+конфиг в порядке: правил 4
+GUI exe -version: 
+== result rc=0
