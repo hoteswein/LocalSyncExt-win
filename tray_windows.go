@@ -531,7 +531,19 @@ func (t *winTray) doAction(a string) {
 		openPath(tc.iniPath)
 	case actNotify:
 		t.toggleNotifications()
+	case actUI:
+		t.openUI()
 	}
+}
+
+func (t *winTray) openUI() {
+	if t.tc.webURL != nil {
+		if u := t.tc.webURL(); u != "" {
+			openPath(u)
+			return
+		}
+	}
+	t.Balloon("LocalSyncExt", "Веб-интерфейс выключен (WebUI=0) или порты не открыты", levelWarn)
 }
 
 func (t *winTray) toggleNotifications() {
@@ -552,6 +564,7 @@ const (
 	idNotify     = 7
 	idAutostart  = 8
 	idExit       = 9
+	idOpenUI     = 10
 	idRuleBase   = 1000 // + номер правила*10 + (0 — синхронизировать, 1 — пауза)
 )
 
@@ -603,6 +616,9 @@ func (t *winTray) showMenu() {
 		appendMenu(menu, mfString, idPauseAll, "Приостановить всё")
 	}
 	appendMenu(menu, mfSeparate, 0, "")
+	if t.tc.webURL != nil && t.tc.webURL() != "" {
+		appendMenu(menu, mfString, idOpenUI, "Открыть веб-интерфейс")
+	}
 	appendMenu(menu, mfString, idOpenLog, "Открыть журнал")
 	appendMenu(menu, mfString, idOpenConfig, "Открыть конфиг (ini)")
 	appendMenu(menu, mfString, idReload, "Перечитать конфиг сейчас")
@@ -649,6 +665,8 @@ func (t *winTray) menuCommand(cmd int, st []RuleStatus) {
 		en.TriggerAll()
 	case cmd == idPauseAll:
 		en.PauseAll(!en.AllPaused())
+	case cmd == idOpenUI:
+		t.openUI()
 	case cmd == idOpenLog:
 		openPath(t.tc.logPath)
 	case cmd == idOpenConfig:

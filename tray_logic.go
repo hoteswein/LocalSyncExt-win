@@ -20,11 +20,12 @@ const (
 	actLog     = "log"     // открыть журнал
 	actConfig  = "config"  // открыть ini
 	actNotify  = "notify"  // включить / выключить уведомления
+	actUI      = "ui"      // открыть веб-интерфейс в браузере
 )
 
 func parseAction(v, def string) string {
 	switch v = strings.ToLower(strings.TrimSpace(v)); v {
-	case actNone, actStatus, actSyncNow, actPause, actLog, actConfig, actNotify:
+	case actNone, actStatus, actSyncNow, actPause, actLog, actConfig, actNotify, actUI:
 		return v
 	}
 	return def
@@ -210,6 +211,7 @@ type trayCtx struct {
 	click    string
 	dblClick string
 	notif    *notifier
+	webURL   func() string // адрес веб-интерфейса на этом компьютере ("" — выключен)
 	reload   func()
 	quit     func()
 }

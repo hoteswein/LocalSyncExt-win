@@ -26,7 +26,7 @@ const (
 	settle     = 2 * time.Second        // только что изменённый файл пропускаем до следующего прохода
 	fileKey    = "<file>"
 	trashDir   = ".LocalSyncTrash"
-	maxEvents  = 300
+	maxEvents  = 1000
 	stateFlush = 5 * time.Second
 )
 
@@ -63,10 +63,15 @@ type ruleRT struct {
 	mu      sync.Mutex // один проход за раз
 	trigger chan struct{}
 
-	smu     sync.Mutex // поля статуса
-	status  string
-	lastErr string
-	lastRun time.Time
+	smu        sync.Mutex // поля статуса
+	status     string
+	lastErr    string
+	lastRun    time.Time
+	lastChange time.Time
+	copied     int64
+	deleted    int64
+	conflicts  int64
+	failed     int64
 
 	paused      atomic.Bool
 	lastCleanup time.Time
@@ -93,6 +98,12 @@ func (rt *ruleRT) setStatus(status, errMsg string) {
 type RuleStatus struct {
 	Name, Status, LastErr string
 	LastRun               time.Time
+	Desc, Mode            string
+	Paths                 []string
+	Enabled, Paused       bool
+	LastChange            time.Time
+	Copied, Deleted       int64
+	Conflicts, Failed     int64
 }
 
 type running struct {
@@ -109,6 +120,8 @@ type Engine struct {
 	events   []Event
 	// OnNotify вызывается для уведомлений (трей подключим позже).
 	OnNotify func(rule, title, msg string)
+	// OnConfig вызывается после применения новой конфигурации (например, чтобы перезапустить веб-сервер).
+	OnConfig func(cfg *Config)
 
 	mu  sync.Mutex
 	ctx context.Context
@@ -155,21 +168,26 @@ func (en *Engine) Statuses() []RuleStatus {
 	defer en.mu.Unlock()
 	var out []RuleStatus
 	for _, r := range en.cfg.Rules {
-		st, msg, last := "idle", "", time.Time{}
+		rs := RuleStatus{Name: r.Name, Status: "idle", Desc: r.Desc, Mode: r.Mode, Enabled: r.Enabled}
+		for _, e := range r.Endpoints {
+			rs.Paths = append(rs.Paths, e.Raw)
+		}
 		if rt := en.rt[r.Name]; rt != nil {
 			rt.smu.Lock()
-			st, msg, last = rt.status, rt.lastErr, rt.lastRun
+			rs.Status, rs.LastErr, rs.LastRun, rs.LastChange = rt.status, rt.lastErr, rt.lastRun, rt.lastChange
+			rs.Copied, rs.Deleted, rs.Conflicts, rs.Failed = rt.copied, rt.deleted, rt.conflicts, rt.failed
 			rt.smu.Unlock()
-		}
-		if rt := en.rt[r.Name]; rt != nil && rt.paused.Load() && st != "syncing" {
-			st = "paused"
+			rs.Paused = rt.paused.Load()
+			if rs.Paused && rs.Status != "syncing" {
+				rs.Status = "paused"
+			}
 		}
 		if r.Err != "" {
-			st, msg = "config-error", r.Err
+			rs.Status, rs.LastErr = "config-error", r.Err
 		} else if !r.Enabled {
-			st = "disabled"
+			rs.Status = "disabled"
 		}
-		out = append(out, RuleStatus{r.Name, st, msg, last})
+		out = append(out, rs)
 	}
 	return out
 }
@@ -354,6 +372,13 @@ func (en *Engine) Stop() {
 // Apply применяет новую конфигурацию «на лету»: неизменённые правила работают без перерыва,
 // изменённые перезапускаются, удалённые останавливаются, новые запускаются.
 func (en *Engine) Apply(cfg *Config) {
+	en.applyRules(cfg)
+	if f := en.OnConfig; f != nil {
+		f(cfg)
+	}
+}
+
+func (en *Engine) applyRules(cfg *Config) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 	en.cfg = cfg
@@ -747,6 +772,17 @@ func (en *Engine) pass(r *Rule, rt *ruleRT, full bool, raws []rawEv, force bool)
 	}
 
 	var ps passStats
+	defer func() {
+		rt.smu.Lock()
+		rt.copied += int64(ps.copied)
+		rt.deleted += int64(ps.deleted)
+		rt.conflicts += int64(ps.conflicts)
+		rt.failed += int64(ps.failed)
+		if ps.copied+ps.deleted+ps.conflicts > 0 {
+			rt.lastChange = time.Now()
+		}
+		rt.smu.Unlock()
+	}()
 	failed := map[string]string{}
 	touched := map[string]string{}
 	for _, j := range jobs {

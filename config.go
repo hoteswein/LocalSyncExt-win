@@ -50,6 +50,8 @@ type Rule struct {
 	TempMode     string       // prefix | work ("" — из [Settings])
 	DirectKB     int          // файлы не больше этого размера пишутся сразу, без временного файла (-1 — из [Settings])
 	workDir      string
+	Desc         string // аннотация (ключ description)
+	Explicit     []KV   // явно заданные опции в порядке файла
 	Endpoints    []*Endpoint
 
 	Masks    []string
@@ -57,11 +59,19 @@ type Rule struct {
 	Err      string
 }
 
+// KV — пара «ключ=значение» с сохранением порядка.
+type KV struct {
+	K string `json:"k"`
+	V string `json:"v"`
+}
+
 type Config struct {
-	WorkDir  string
-	Settings map[string]string
-	Rules    []*Rule
-	Warnings []string
+	WorkDir       string
+	Header        []string // комментарии в начале файла
+	SettingsOrder []string
+	Settings      map[string]string
+	Rules         []*Rule
+	Warnings      []string
 }
 
 func newRule(name string) *Rule {
@@ -161,6 +171,8 @@ func (r *Rule) setOption(k, v string, cfg *Config) {
 			return
 		}
 		r.DirectKB = n
+	case "description", "desc":
+		r.Desc = v
 	case "debounce":
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 100 || n > 60000 {
@@ -209,10 +221,16 @@ func ParseConfig(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	text := strings.TrimPrefix(string(data), "\ufeff")
+	return ParseConfigText(string(data))
+}
+
+// ParseConfigText разбирает текст конфигурации (см. ParseConfig).
+func ParseConfigText(text string) (*Config, error) {
+	text = strings.TrimPrefix(text, "\ufeff")
 	cfg := &Config{Settings: map[string]string{}}
 	var cur *Rule
 	inSettings := false
+	started := false // встретилась ли первая секция или строка настройки
 	sc := bufio.NewScanner(strings.NewReader(text))
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 	ln := 0
@@ -223,8 +241,12 @@ func ParseConfig(path string) (*Config, error) {
 		ln++
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || line[0] == ';' || line[0] == '#' {
+			if !started && line != "" {
+				cfg.Header = append(cfg.Header, line)
+			}
 			continue
 		}
+		started = true
 		if line[0] == '[' && line[len(line)-1] == ']' {
 			name := strings.TrimSpace(line[1 : len(line)-1])
 			if strings.EqualFold(name, "settings") {
@@ -251,12 +273,18 @@ func ParseConfig(path string) (*Config, error) {
 		}
 		k, v = strings.ToLower(strings.TrimSpace(k)), strings.TrimSpace(v)
 		if inSettings {
+			if _, dup := cfg.Settings[k]; !dup {
+				cfg.SettingsOrder = append(cfg.SettingsOrder, k)
+			}
 			cfg.Settings[k] = v
 			continue
 		}
 		if cur == nil {
 			warn("опция вне правила: %s", line)
 			continue
+		}
+		if k != "description" && k != "desc" {
+			cur.record(k, v)
 		}
 		cur.setOption(k, v, cfg)
 	}
@@ -510,4 +538,63 @@ func (r *Rule) sig() string {
 		sb.WriteString("|" + e.Raw)
 	}
 	return sb.String()
+}
+
+// record запоминает явно заданную опцию (для сохранения конфига из веб-интерфейса).
+func (r *Rule) record(k, v string) {
+	for i := range r.Explicit {
+		if r.Explicit[i].K == k {
+			r.Explicit[i].V = v
+			return
+		}
+	}
+	r.Explicit = append(r.Explicit, KV{k, v})
+}
+
+var canonKeys = map[string]string{
+	"trashdays": "TrashDays", "maxdeletepercent": "MaxDeletePercent", "deleteextra": "DeleteExtra",
+	"directbelow": "DirectBelow", "nomarker": "NoMarker", "trayclick": "TrayClick",
+	"traydoubleclick": "TrayDoubleClick", "workdir": "WorkDir", "logfile": "LogFile",
+	"statedir": "StateDir", "webui": "WebUI", "webportopen": "WebPortOpen", "webportauth": "WebPortAuth",
+	"webopenbind": "WebOpenBind", "webauthbind": "WebAuthBind", "webhosts": "WebHosts",
+	"notifications": "Notifications", "trash": "Trash", "temp": "Temp",
+}
+
+func canonKey(k string) string {
+	if c, ok := canonKeys[k]; ok {
+		return c
+	}
+	return k
+}
+
+// Render записывает конфигурацию обратно в текст ini (комментарии внутри правил не сохраняются).
+func (c *Config) Render() string {
+	var b strings.Builder
+	for _, h := range c.Header {
+		b.WriteString(h + "\n")
+	}
+	if len(c.Header) > 0 {
+		b.WriteString("\n")
+	}
+	if len(c.SettingsOrder) > 0 {
+		b.WriteString("[Settings]\n")
+		for _, k := range c.SettingsOrder {
+			fmt.Fprintf(&b, "%s=%s\n", canonKey(k), c.Settings[k])
+		}
+		b.WriteString("\n")
+	}
+	for _, r := range c.Rules {
+		fmt.Fprintf(&b, "[%s]\n", r.Name)
+		if r.Desc != "" {
+			fmt.Fprintf(&b, "description=%s\n", r.Desc)
+		}
+		for _, kv := range r.Explicit {
+			fmt.Fprintf(&b, "%s=%s\n", canonKey(kv.K), kv.V)
+		}
+		for _, e := range r.Endpoints {
+			b.WriteString(e.Raw + "\n")
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }

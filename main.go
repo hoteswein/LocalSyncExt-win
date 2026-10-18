@@ -41,10 +41,13 @@ func main() {
 	check := flag.Bool("check", false, "проверить конфиг и выйти")
 	showVer := flag.Bool("version", false, "версия")
 	trayFlag := flag.Bool("tray", false, "работать со значком в трее (в версии без консоли включено всегда)")
+	webUser := flag.String("web-user", "", "задать логин веб-интерфейса (вместе с -web-pass) и выйти")
+	webPass := flag.String("web-pass", "", "задать пароль веб-интерфейса (вместе с -web-user) и выйти")
 	flag.Parse()
 
 	isGUI := guiBuild == "1"
-	oneShot := *once || *check || *showVer
+	setCreds := *webUser != "" || *webPass != ""
+	oneShot := *once || *check || *showVer || setCreds
 	if isGUI && oneShot {
 		attachConsole() // версия без консоли: вывод в окно, из которого запущена
 	}
@@ -98,6 +101,14 @@ func main() {
 	if stateDir == "" {
 		stateDir = filepath.Join(exeDir, "state")
 	}
+	if setCreds {
+		if err := loadCreds(stateDir).Set(*webUser, *webPass); err != nil {
+			fmt.Fprintln(os.Stderr, "не удалось задать логин и пароль:", err)
+			os.Exit(1)
+		}
+		fmt.Println("логин и пароль веб-интерфейса сохранены")
+		return
+	}
 	en := NewEngine(cfg, stateDir, *dry, w)
 	bad := en.report(cfg)
 	if *check {
@@ -129,6 +140,25 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	reload := func() {
+		c, err := loadConfig(*cfgPath)
+		if err != nil {
+			en.logf("config", "ERROR", "не удалось перечитать конфиг: %v", err)
+			return
+		}
+		en.logf("config", "INFO", "конфиг перечитан")
+		en.report(c)
+		en.Apply(c)
+	}
+	web := NewWebServer(en, *cfgPath, logPath, stateDir, version, reload)
+	en.OnConfig = func(c *Config) {
+		wc, errs := parseWebCfg(c.Settings)
+		for _, e := range errs {
+			en.logf("web", "ERROR", "%s", e)
+		}
+		web.Apply(wc)
+	}
+	defer web.Stop()
 	en.logf("main", "INFO", "LocalSyncExt %s запущен, правил: %d. Изменения %s применяются на лету", version, len(cfg.Rules), filepath.Base(*cfgPath))
 	en.Start(ctx)
 	go en.WatchConfig(ctx, *cfgPath, loadConfig)
@@ -137,19 +167,11 @@ func main() {
 		tc := &trayCtx{
 			en: en, version: version, logPath: logPath, iniPath: *cfgPath, stateDir: stateDir, exePath: exe,
 			click:    parseAction(cfg.Settings["trayclick"], actStatus),
-			dblClick: parseAction(cfg.Settings["traydoubleclick"], actSyncNow),
+			dblClick: parseAction(cfg.Settings["traydoubleclick"], actUI),
 			notif:    nt,
 			quit:     stop,
-			reload: func() {
-				c, err := loadConfig(*cfgPath)
-				if err != nil {
-					en.logf("config", "ERROR", "не удалось перечитать конфиг: %v", err)
-					return
-				}
-				en.logf("config", "INFO", "конфиг перечитан по запросу")
-				en.report(c)
-				en.Apply(c)
-			},
+			webURL:   web.URL,
+			reload:   reload,
 		}
 		go func() {
 			<-ctx.Done()
