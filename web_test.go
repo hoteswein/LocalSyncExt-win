@@ -167,6 +167,9 @@ func TestOpenPortAPI(t *testing.T) {
 	if code, _ := do(t, c, "GET", s.URL+"/app.js", nil, nil); code != 200 {
 		t.Fatal("app.js")
 	}
+	if code, b := do(t, c, "GET", s.URL+"/favicon.ico", nil, nil); code != 200 || len(b) < 100 || !bytes.HasPrefix(b, []byte{0, 0, 1, 0}) {
+		t.Fatalf("favicon: %d, %d байт", code, len(b))
+	}
 	code, b := do(t, c, "GET", s.URL+"/api/me", nil, nil)
 	if code != 200 || !strings.Contains(string(b), `"auth":false`) {
 		t.Fatalf("me: %d %s", code, b)

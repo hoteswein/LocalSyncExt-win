@@ -31,7 +31,7 @@ func TestIconsAcceptedByWindows(t *testing.T) {
 			t.Fatal(err)
 		}
 		tr := &winTray{set: set}
-		all := append([][]byte{set.idle, set.paused, set.err}, set.spin...)
+		all := [][]byte{set.on, set.active, set.paused, set.err}
 		for i, data := range all {
 			h, err := tr.makeIcon(data)
 			if err != nil || h == 0 {

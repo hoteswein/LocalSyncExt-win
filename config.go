@@ -554,7 +554,7 @@ func (r *Rule) record(k, v string) {
 var canonKeys = map[string]string{
 	"trashdays": "TrashDays", "maxdeletepercent": "MaxDeletePercent", "deleteextra": "DeleteExtra",
 	"directbelow": "DirectBelow", "nomarker": "NoMarker", "trayclick": "TrayClick",
-	"traydoubleclick": "TrayDoubleClick", "workdir": "WorkDir", "logfile": "LogFile",
+	"traydoubleclick": "TrayDoubleClick", "trayblinkms": "TrayBlinkMs", "workdir": "WorkDir", "logfile": "LogFile",
 	"statedir": "StateDir", "webui": "WebUI", "webportopen": "WebPortOpen", "webportauth": "WebPortAuth",
 	"webopenbind": "WebOpenBind", "webauthbind": "WebAuthBind", "webhosts": "WebHosts",
 	"notifications": "Notifications", "trash": "Trash", "temp": "Temp",

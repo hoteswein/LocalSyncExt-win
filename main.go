@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -164,10 +165,15 @@ func main() {
 	go en.WatchConfig(ctx, *cfgPath, loadConfig)
 
 	if useTray {
+		blink := 200 * time.Millisecond
+		if v, err := strconv.Atoi(cfg.Settings["trayblinkms"]); err == nil && v >= 50 && v <= 5000 {
+			blink = time.Duration(v) * time.Millisecond
+		}
 		tc := &trayCtx{
 			en: en, version: version, logPath: logPath, iniPath: *cfgPath, stateDir: stateDir, exePath: exe,
 			click:    parseAction(cfg.Settings["trayclick"], actStatus),
 			dblClick: parseAction(cfg.Settings["traydoubleclick"], actUI),
+			blink:    blink,
 			notif:    nt,
 			quit:     stop,
 			webURL:   web.URL,

@@ -13,8 +13,6 @@ import (
 //go:embed assets/*.png
 var assetsFS embed.FS
 
-const spinFrames = 8
-
 var iconSizes = []int{16, 20, 24, 32, 40, 48}
 
 // pickSize выбирает ближайший доступный размер не меньше нужного.
@@ -55,13 +53,14 @@ func iconImage(pngData []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// iconSet — готовые данные значков одного размера.
+// iconSet — готовые данные значков одного размера:
+// on — рабочий режим, active — идёт синхронизация (мигает с on), paused — пауза, err — ошибка (on с красным бейджем).
 type iconSet struct {
 	size   int
-	idle   []byte
+	on     []byte
+	active []byte
 	paused []byte
 	err    []byte
-	spin   [][]byte
 }
 
 func loadIconImage(name string) ([]byte, error) {
@@ -75,22 +74,12 @@ func loadIconImage(name string) ([]byte, error) {
 func loadIconSet(want int) (*iconSet, error) {
 	s := pickSize(want)
 	set := &iconSet{size: s}
-	var err error
-	if set.idle, err = loadIconImage(fmt.Sprintf("idle_%d.png", s)); err != nil {
-		return nil, err
-	}
-	if set.paused, err = loadIconImage(fmt.Sprintf("paused_%d.png", s)); err != nil {
-		return nil, err
-	}
-	if set.err, err = loadIconImage(fmt.Sprintf("error_%d.png", s)); err != nil {
-		return nil, err
-	}
-	for i := 0; i < spinFrames; i++ {
-		f, err := loadIconImage(fmt.Sprintf("spin%d_%d.png", i, s))
+	for name, dst := range map[string]*[]byte{"on": &set.on, "active": &set.active, "paused": &set.paused, "error": &set.err} {
+		img, err := loadIconImage(fmt.Sprintf("%s_%d.png", name, s))
 		if err != nil {
 			return nil, err
 		}
-		set.spin = append(set.spin, f)
+		*dst = img
 	}
 	return set, nil
 }

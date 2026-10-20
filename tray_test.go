@@ -52,8 +52,11 @@ func TestEmbeddedIconSets(t *testing.T) {
 		if err != nil {
 			t.Fatalf("размер %d: %v", s, err)
 		}
-		if set.size != s || len(set.spin) != spinFrames {
-			t.Fatalf("набор %d: размер %d, кадров %d", s, set.size, len(set.spin))
+		if set.size != s || len(set.on) == 0 || len(set.active) == 0 || len(set.paused) == 0 || len(set.err) == 0 {
+			t.Fatalf("набор %d неполный: %+v", s, set.size)
+		}
+		if bytes.Equal(set.on, set.active) || bytes.Equal(set.on, set.paused) || bytes.Equal(set.on, set.err) {
+			t.Fatalf("значки состояний должны отличаться друг от друга (размер %d)", s)
 		}
 	}
 	if pickSize(17) != 20 || pickSize(100) != 48 || pickSize(1) != 16 {

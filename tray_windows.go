@@ -231,13 +231,13 @@ func setAutostart(on bool, exe string) error {
 // ---------- значок в трее ----------
 
 type winTray struct {
-	tc    *trayCtx
-	hwnd  uintptr
-	set   *iconSet
-	idle  uintptr
-	pause uintptr
-	errI  uintptr
-	spin  []uintptr
+	tc     *trayCtx
+	hwnd   uintptr
+	set    *iconSet
+	on     uintptr
+	active uintptr
+	pause  uintptr
+	errI   uintptr
 
 	taskbarCreated uint32
 
@@ -266,7 +266,10 @@ func runTray(tc *trayCtx) error {
 	}
 	t := &winTray{tc: tc, set: set}
 	theTray = t
-	if t.idle, err = t.makeIcon(set.idle); err != nil {
+	if t.on, err = t.makeIcon(set.on); err != nil {
+		return err
+	}
+	if t.active, err = t.makeIcon(set.active); err != nil {
 		return err
 	}
 	if t.pause, err = t.makeIcon(set.paused); err != nil {
@@ -275,15 +278,8 @@ func runTray(tc *trayCtx) error {
 	if t.errI, err = t.makeIcon(set.err); err != nil {
 		return err
 	}
-	for _, f := range set.spin {
-		h, err := t.makeIcon(f)
-		if err != nil {
-			return err
-		}
-		t.spin = append(t.spin, h)
-	}
 	defer func() {
-		for _, h := range append([]uintptr{t.idle, t.pause, t.errI}, t.spin...) {
+		for _, h := range []uintptr{t.on, t.active, t.pause, t.errI} {
 			pDestroyIcon.Call(h)
 		}
 	}()
@@ -306,7 +302,7 @@ func runTray(tc *trayCtx) error {
 	if t.hwnd == 0 {
 		return fmt.Errorf("не удалось создать окно сообщений")
 	}
-	if err := t.notifyIcon(nimAdd, t.idle, t.tooltip()); err != nil {
+	if err := t.notifyIcon(nimAdd, t.on, t.tooltip()); err != nil {
 		return err
 	}
 	defer t.notifyIcon(nimDelete, 0, "")
@@ -360,60 +356,73 @@ func (t *winTray) post(msg uint32, wp, lp uintptr) {
 	pPostMessage.Call(t.hwnd, uintptr(msg), wp, lp)
 }
 
-// animate: раз в ~120 мс выбирает значок по состоянию; при синхронизации крутит стрелки.
+// Коды значков для сообщения wmSetIcon.
+const (
+	icoOn     = 0
+	icoActive = 1
+	icoPaused = 2
+	icoError  = 3
+)
+
+// animate: выбирает значок по состоянию. Во время синхронизации значки on и active мигают
+// с периодом TrayBlinkMs (по умолчанию 200 мс); в покое — on, на паузе — paused, при ошибке — on с бейджем.
 func (t *winTray) animate(done chan struct{}) {
-	tk := time.NewTicker(120 * time.Millisecond)
+	blink := t.tc.blink
+	if blink < 50 {
+		blink = 200
+	}
+	tk := time.NewTicker(blink)
 	defer tk.Stop()
-	frame := 0
-	lastIdx := -2
+	phase := false
+	last := -1
 	lastTip := ""
-	ticks := 0
+	lastTipAt := time.Time{}
 	for {
 		select {
 		case <-done:
 			return
 		case <-tk.C:
 		}
-		busy := t.tc.en.Busy()
-		idx := -1 // -1 — обычный значок
-		switch {
-		case busy:
-			idx = frame % spinFrames
-			frame++
-		default:
-			frame = 0
+		code := icoOn
+		if t.tc.en.Busy() {
+			phase = !phase
+			if phase {
+				code = icoActive
+			}
+		} else {
+			phase = false
 			st := t.tc.en.Statuses()
 			switch computeState(false, t.tc.en.AllPaused(), st) {
 			case stError:
-				idx = -3
+				code = icoError
 			case stPaused:
-				idx = -4
+				code = icoPaused
 			}
 		}
-		ticks++
-		if idx != lastIdx {
-			lastIdx = idx
-			t.post(wmSetIcon, 0, uintptr(int32(idx)))
-		}
-		if ticks%8 == 0 { // подсказка — реже
+		tipChanged := false
+		if time.Since(lastTipAt) > time.Second { // подсказка обновляется реже значка
+			lastTipAt = time.Now()
 			if tip := t.tooltip(); tip != lastTip {
-				lastTip = tip
-				t.post(wmSetIcon, 1, uintptr(int32(lastIdx)))
+				lastTip, tipChanged = tip, true
 			}
+		}
+		if code != last || tipChanged {
+			last = code
+			t.post(wmSetIcon, 0, uintptr(code))
 		}
 	}
 }
 
-func (t *winTray) iconFor(idx int32) uintptr {
-	switch {
-	case idx >= 0 && int(idx) < len(t.spin):
-		return t.spin[idx]
-	case idx == -3:
-		return t.errI
-	case idx == -4:
+func (t *winTray) iconFor(code int32) uintptr {
+	switch code {
+	case icoActive:
+		return t.active
+	case icoPaused:
 		return t.pause
+	case icoError:
+		return t.errI
 	}
-	return t.idle
+	return t.on
 }
 
 func (t *winTray) showBalloon(b balloon) {
@@ -481,7 +490,7 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	if uint32(msg) == t.taskbarCreated && t.taskbarCreated != 0 { // перезапуск проводника
 		ic := t.cur
 		if ic == 0 {
-			ic = t.idle
+			ic = t.on
 		}
 		t.notifyIcon(nimAdd, ic, t.tooltip())
 		return 0

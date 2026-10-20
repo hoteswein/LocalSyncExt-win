@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-//go:embed web/index.html web/app.js web/style.css
+//go:embed web/index.html web/app.js web/style.css web/favicon.ico
 var webFS embed.FS
 
 const sessionCookie = "lsx_session"
@@ -284,6 +284,7 @@ func (w *WebServer) handler(open bool) http.Handler {
 	static("index.html", "text/html; charset=utf-8")
 	static("app.js", "text/javascript; charset=utf-8")
 	static("style.css", "text/css; charset=utf-8")
+	static("favicon.ico", "image/x-icon")
 
 	guard := func(h func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 		return func(rw http.ResponseWriter, r *http.Request) {

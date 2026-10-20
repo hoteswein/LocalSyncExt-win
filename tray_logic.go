@@ -210,6 +210,7 @@ type trayCtx struct {
 	exePath  string
 	click    string
 	dblClick string
+	blink    time.Duration // период мигания значков при синхронизации
 	notif    *notifier
 	webURL   func() string // адрес веб-интерфейса на этом компьютере ("" — выключен)
 	reload   func()
