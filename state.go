@@ -13,6 +13,9 @@ import (
 type Base struct {
 	Size  int64 `json:"s"`
 	MTime int64 `json:"m"`
+	// Obs — время изменения, которое мы видели на каждом пути после синхронизации.
+	// Нужно, когда диск не сохраняет время изменения как есть (облако, некоторые сетевые диски).
+	Obs map[string]int64 `json:"o,omitempty"`
 }
 
 type State struct {

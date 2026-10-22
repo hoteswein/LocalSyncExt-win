@@ -22,8 +22,7 @@ import (
 )
 
 const (
-	tolNS      = int64(2 * time.Second) // допуск времени (FAT/exFAT хранят с точностью 2 с)
-	settle     = 2 * time.Second        // только что изменённый файл пропускаем до следующего прохода
+	settle     = 2 * time.Second // только что изменённый файл пропускаем до следующего прохода
 	fileKey    = "<file>"
 	trashDir   = ".LocalSyncTrash"
 	maxEvents  = 1000
@@ -32,6 +31,7 @@ const (
 
 var (
 	errSourceChanged    = errors.New("файл изменился во время копирования")
+	errStalled          = errors.New("нет ответа от диска (завис или отключился)")
 	errWatchUnsupported = errors.New("слежение за папками не поддерживается на этой ОС")
 )
 
@@ -43,8 +43,9 @@ type FInfo struct {
 
 // epCache — известное содержимое пути (в памяти), чтобы по событию проверять только изменённое.
 type epCache struct {
-	files map[string]FInfo  // ключ (нижний регистр, '/') -> файл
-	dirs  map[string]string // ключ папки -> относительный путь
+	files map[string]FInfo    // ключ (нижний регистр, '/') -> файл
+	dirs  map[string]string   // ключ папки -> относительный путь
+	coll  map[string][]string // ключи, под которые попали файлы, отличающиеся только регистром
 }
 
 type rawEv struct {
@@ -472,6 +473,9 @@ func (en *Engine) WatchConfig(ctx context.Context, file string, load func(string
 
 func (en *Engine) startWatchers(ctx context.Context, r *Rule, emit func(ep int, rel string, overflow bool), bad *atomic.Bool) {
 	for i, e := range r.Endpoints {
+		if r.kind(i) != "local" {
+			continue // сетевые диски и облако событий не присылают — их проверяет периодическое сканирование
+		}
 		go func(i int, dir string) {
 			attempts := 0
 			for ctx.Err() == nil {
@@ -534,6 +538,7 @@ func (en *Engine) ruleLoop(ctx context.Context, r *Rule, rt *ruleRT) {
 	var raws []rawEv
 	var retryAt time.Time
 	run := true
+	streak := 0
 
 	for {
 		if lost.Swap(false) {
@@ -554,6 +559,19 @@ func (en *Engine) ruleLoop(ctx context.Context, r *Rule, rt *ruleRT) {
 			wasFull := needFull
 			retry, err := en.pass(r, rt, needFull, batch, false)
 			needFull, run = false, false
+			if err != nil {
+				if streak < 8 {
+					streak++
+				}
+				if back := 30 * time.Second << uint(streak-1); back > retry {
+					retry = back // 30 с, 1 мин, 2 мин ... до 10 минут (сеть могла пропасть надолго)
+				}
+				if retry > 10*time.Minute {
+					retry = 10 * time.Minute
+				}
+			} else {
+				streak = 0
+			}
 			if wasFull {
 				nextFull = time.Now().Add(en.scanEvery(r, &watchBad))
 			}
@@ -669,6 +687,7 @@ type job struct {
 	deletes     []int
 	noBase      bool
 	askConflict bool
+	wi          FInfo // версия победителя на момент планирования (для базы состояния)
 }
 
 type passStats struct{ copied, deleted, conflicts, failed, pending int }
@@ -714,7 +733,7 @@ func (en *Engine) pass(r *Rule, rt *ruleRT, full bool, raws []rawEv, force bool)
 	if full || rt.cache == nil {
 		cache := make([]*epCache, n)
 		for i, e := range r.Endpoints {
-			c, serr := scanEndpoint(r, e)
+			c, serr := scanGuarded(r, i, e)
 			if serr != nil {
 				rt.cache = nil
 				return 0, fmt.Errorf("сканирование %s: %w", e.Raw, serr)
@@ -760,6 +779,9 @@ func (en *Engine) pass(r *Rule, rt *ruleRT, full bool, raws []rawEv, force bool)
 		total = len(st.Base)
 	}
 
+	if len(rt.cache) > 0 {
+		jobs = en.skipCaseCollisions(r, rt, jobs)
+	}
 	dels := 0
 	for _, j := range jobs {
 		if j.winner < 0 && len(j.deletes) > 0 {
@@ -785,15 +807,34 @@ func (en *Engine) pass(r *Rule, rt *ruleRT, full bool, raws []rawEv, force bool)
 	}()
 	failed := map[string]string{}
 	touched := map[string]string{}
+	var okWin []*job
 	for _, j := range jobs {
 		touched[j.key] = j.rel
 		if !en.execJob(r, rt, st, scans, j, &ps) {
 			failed[j.key] = j.rel
+		} else if j.winner >= 0 && !j.noBase && !j.askConflict {
+			okWin = append(okWin, j)
 		}
 	}
 	if len(touched) > 0 && !en.dry {
 		if rerr := en.refreshKeys(r, rt, touched); rerr != nil {
 			rt.cache = nil
+		}
+	}
+	if !en.dry {
+		for _, j := range okWin {
+			b := Base{Size: j.wi.Size, MTime: j.wi.MTime}
+			if rt.cache != nil { // что реально увидели на каждом пути после копирования
+				b.Obs = map[string]int64{}
+				for i, e := range r.Endpoints {
+					if i == j.winner {
+						b.Obs[epID(e)] = j.wi.MTime
+					} else if f, ok := rt.cache[i].files[j.key]; ok && f.Size == j.wi.Size {
+						b.Obs[epID(e)] = f.MTime
+					}
+				}
+			}
+			st.setBase(j.key, b)
 		}
 	}
 	rt.pend = map[string]string{}
@@ -837,7 +878,16 @@ func (en *Engine) checkEndpoints(r *Rule, st *State) ([]bool, error) {
 		key := strings.ToLower(e.Raw)
 		id, known := st.IDs[key]
 		joining[i] = !known && len(st.Base) > 0
-		fi, err := os.Stat(e.Dir)
+		var fi os.FileInfo
+		var err error
+		if d := r.stall(i) / 3; d > 0 { // удалённый диск может зависнуть: не ждём вечно
+			err = guardOp(d, func() (serr error) { fi, serr = os.Stat(e.Dir); return })
+			if errors.Is(err, errStalled) {
+				return nil, fmt.Errorf("%s не отвечает более %v — правило приостановлено до восстановления связи, ничего не удалено", e.Dir, d)
+			}
+		} else {
+			fi, err = os.Stat(e.Dir)
+		}
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
 				return nil, fmt.Errorf("%s: %w", e.Dir, err)
@@ -854,7 +904,11 @@ func (en *Engine) checkEndpoints(r *Rule, st *State) ([]bool, error) {
 		} else if !fi.IsDir() {
 			return nil, fmt.Errorf("%s — не папка", e.Dir)
 		}
-		if vid := volumeID(e.Dir); vid != "" {
+		vid := ""
+		if r.stall(i) == 0 {
+			vid = volumeID(e.Dir)
+		}
+		if vid != "" {
 			if old := st.Vols[key]; old != "" && old != vid {
 				return nil, fmt.Errorf("%s: изменился серийный номер тома (был %s, стал %s) — диск подменён или отформатирован. Правило приостановлено; чтобы принять новый диск, удалите файл состояния %s", e.Dir, old, vid, en.statePath(r))
 			} else if old == "" && !en.dry {
@@ -878,7 +932,11 @@ func (en *Engine) checkEndpoints(r *Rule, st *State) ([]bool, error) {
 			known = false // раньше маркер не использовался — начинаем
 		}
 		marker := filepath.Join(e.Dir, markerName(r.Name))
-		b, rerr := os.ReadFile(marker)
+		var b []byte
+		rerr := r.op(i, func() (xerr error) { b, xerr = os.ReadFile(marker); return })
+		if errors.Is(rerr, errStalled) {
+			return nil, fmt.Errorf("%s не отвечает — правило приостановлено", e.Dir)
+		}
 		switch {
 		case rerr == nil:
 			got := strings.TrimSpace(string(b))
@@ -950,12 +1008,45 @@ func isHot(mtime int64, now time.Time) bool {
 }
 
 func newCache() *epCache {
-	return &epCache{files: map[string]FInfo{}, dirs: map[string]string{}}
+	return &epCache{files: map[string]FInfo{}, dirs: map[string]string{}, coll: map[string][]string{}}
 }
 
 func relKey(rel string) string { return strings.ToLower(filepath.ToSlash(rel)) }
 
-func scanEndpoint(r *Rule, e *Endpoint) (*epCache, error) {
+// scanGuarded сканирует путь; для удалённых путей прерывается, если обход не движется дольше таймаута.
+func scanGuarded(r *Rule, i int, e *Endpoint) (*epCache, error) {
+	stall := r.stall(i)
+	if stall == 0 {
+		return scanEndpoint(r, e, nil)
+	}
+	type res struct {
+		c   *epCache
+		err error
+	}
+	var prog atomic.Int64
+	done := make(chan res, 1)
+	go func() {
+		c, err := scanEndpoint(r, e, &prog)
+		done <- res{c, err}
+	}()
+	last, lastT := int64(-1), time.Now()
+	tk := time.NewTicker(time.Second)
+	defer tk.Stop()
+	for {
+		select {
+		case x := <-done:
+			return x.c, x.err
+		case <-tk.C:
+			if p := prog.Load(); p != last {
+				last, lastT = p, time.Now()
+			} else if time.Since(lastT) > stall {
+				return nil, errStalled
+			}
+		}
+	}
+}
+
+func scanEndpoint(r *Rule, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
 	c := newCache()
 	if r.FileMode {
 		fi, err := os.Lstat(filepath.Join(e.Dir, e.File))
@@ -979,6 +1070,9 @@ func scanEndpoint(r *Rule, e *Endpoint) (*epCache, error) {
 		}
 		if p == root {
 			return nil
+		}
+		if prog != nil {
+			prog.Add(1)
 		}
 		if d.Type()&(fs.ModeSymlink|fs.ModeIrregular) != 0 {
 			return nil
@@ -1011,7 +1105,14 @@ func scanEndpoint(r *Rule, e *Endpoint) (*epCache, error) {
 		}
 		rel, _ := filepath.Rel(root, p)
 		rel = filepath.ToSlash(rel)
-		c.files[strings.ToLower(rel)] = FInfo{Rel: rel, Size: info.Size(), MTime: info.ModTime().UnixNano()}
+		key := strings.ToLower(rel)
+		if prev, dup := c.files[key]; dup {
+			if len(c.coll[key]) == 0 {
+				c.coll[key] = []string{prev.Rel}
+			}
+			c.coll[key] = append(c.coll[key], rel)
+		}
+		c.files[key] = FInfo{Rel: rel, Size: info.Size(), MTime: info.ModTime().UnixNano()}
 		return nil
 	})
 	return c, err
@@ -1217,8 +1318,15 @@ func keyList(scans []map[string]FInfo, extra map[string]bool, only map[string]st
 	return keys
 }
 
+func epID(e *Endpoint) string { return strings.ToLower(e.Raw) }
+
 func (en *Engine) planTwoWay(r *Rule, st *State, scans []map[string]FInfo, joining []bool, only map[string]string, now time.Time) ([]*job, map[string]string) {
 	n := len(scans)
+	tol := r.tol()
+	epIDs := make([]string, n)
+	for i, e := range r.Endpoints {
+		epIDs[i] = epID(e)
+	}
 	baseKeys := map[string]bool{}
 	if only == nil {
 		for k := range st.Base {
@@ -1244,6 +1352,19 @@ func (en *Engine) planTwoWay(r *Rule, st *State, scans []map[string]FInfo, joini
 			continue
 		}
 		b, hasBase := st.Base[key]
+		modified := func(i int, c *FInfo, b Base) bool {
+			if c.Size != b.Size {
+				return true
+			}
+			if !r.mtimeReliable(i) {
+				return false // облако: время не сохраняется, меняется только размер
+			}
+			ref := b.MTime
+			if o, ok := b.Obs[epIDs[i]]; ok {
+				ref = o
+			}
+			return absI64(c.MTime-ref) > tol
+		}
 		var mods, dels []int
 		for i := 0; i < n; i++ {
 			c := cur[i]
@@ -1252,7 +1373,7 @@ func (en *Engine) planTwoWay(r *Rule, st *State, scans []map[string]FInfo, joini
 				if hasBase && !joining[i] {
 					dels = append(dels, i)
 				}
-			case !hasBase, c.Size != b.Size, absI64(c.MTime-b.MTime) > tolNS:
+			case !hasBase || modified(i, c, b):
 				mods = append(mods, i)
 			}
 		}
@@ -1270,29 +1391,35 @@ func (en *Engine) planTwoWay(r *Rule, st *State, scans []map[string]FInfo, joini
 			continue
 		}
 
+		isMod := map[int]bool{}
+		for _, i := range mods {
+			isMod[i] = true
+		}
 		same := func(i, k int) bool {
 			a, c := cur[i], cur[k]
 			if a.Size != c.Size {
 				return false
 			}
-			if absI64(a.MTime-c.MTime) <= tolNS {
+			unrel := !r.mtimeReliable(i) || !r.mtimeReliable(k)
+			if !unrel && absI64(a.MTime-c.MTime) <= tol {
 				return true
+			}
+			if unrel && hasBase && !(isMod[i] && isMod[k]) {
+				return false // не скачиваем файл из облака ради сравнения: проще скопировать заново
 			}
 			ha, e1 := hashFile(r.abs(r.Endpoints[i], a.Rel))
 			hb, e2 := hashFile(r.abs(r.Endpoints[k], c.Rel))
 			return e1 == nil && e2 == nil && ha == hb
 		}
+		// победитель: у кого время изменения надёжно и новее (у облака время ненадёжно — оно проигрывает)
 		w := mods[0]
 		for _, i := range mods[1:] {
-			if cur[i].MTime > cur[w].MTime {
+			ri, rw := r.mtimeReliable(i), r.mtimeReliable(w)
+			if (ri && !rw) || (ri == rw && cur[i].MTime > cur[w].MTime) {
 				w = i
 			}
 		}
-		isMod := map[int]bool{}
-		for _, i := range mods {
-			isMod[i] = true
-		}
-		j := &job{key: key, rel: cur[w].Rel, winner: w}
+		j := &job{key: key, rel: cur[w].Rel, winner: w, wi: *cur[w]}
 		for i := 0; i < n; i++ {
 			if i == w {
 				continue
@@ -1301,7 +1428,7 @@ func (en *Engine) planTwoWay(r *Rule, st *State, scans []map[string]FInfo, joini
 			case cur[i] == nil:
 				j.copies = append(j.copies, copyTo{dst: i})
 			case same(w, i):
-				if absI64(cur[w].MTime-cur[i].MTime) > tolNS {
+				if r.mtimeReliable(i) && r.mtimeReliable(w) && absI64(cur[w].MTime-cur[i].MTime) > tol {
 					j.touch = append(j.touch, i)
 				}
 			case isMod[i]:
@@ -1320,6 +1447,7 @@ func (en *Engine) planTwoWay(r *Rule, st *State, scans []map[string]FInfo, joini
 
 func (en *Engine) planOneWay(r *Rule, scans []map[string]FInfo, only map[string]string, now time.Time) ([]*job, map[string]string) {
 	m := r.Master
+	tol := r.tol()
 	var jobs []*job
 	hotKeys := map[string]string{}
 	for _, key := range keyList(scans, nil, only) {
@@ -1339,7 +1467,7 @@ func (en *Engine) planOneWay(r *Rule, scans []map[string]FInfo, only map[string]
 					hotKeys[key] = mi.Rel
 					continue
 				}
-				if !ok || si.Size != mi.Size || absI64(si.MTime-mi.MTime) > tolNS {
+				if !ok || si.Size != mi.Size || (r.mtimeReliable(i) && r.mtimeReliable(m) && absI64(si.MTime-mi.MTime) > tol) {
 					j.copies = append(j.copies, copyTo{dst: i})
 				}
 			}
@@ -1401,7 +1529,7 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 				cn := conflictName(dst, labelOf(e, c.dst), time.Unix(0, old.MTime))
 				en.logf(r.Name, "WARN", "конфликт: %s сохранён как %s", dst, filepath.Base(cn))
 				if !en.dry {
-					if err := os.Rename(dst, cn); err != nil {
+					if err := r.op(c.dst, func() error { return os.Rename(dst, cn) }); err != nil {
 						en.logf(r.Name, "ERROR", "не удалось переименовать %s: %v", dst, err)
 						ps.failed++
 						ok = false
@@ -1412,7 +1540,7 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 				en.notify(r, "Конфликт файлов", filepath.Base(dst)+" — сохранена конфликтная копия")
 			}
 			en.logf(r.Name, "INFO", "копирую %s -> %s", src, dst)
-			if err := en.copyFile(r, src, wi, c.dst, dst); err != nil {
+			if err := en.copyFile(r, j.winner, src, wi, c.dst, dst); err != nil {
 				ok = false
 				if errors.Is(err, errSourceChanged) {
 					ps.pending++
@@ -1428,7 +1556,8 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 		for _, i := range j.touch {
 			if !en.dry {
 				mt := time.Unix(0, wi.MTime)
-				_ = os.Chtimes(r.abs(r.Endpoints[i], scans[i][j.key].Rel), mt, mt)
+				p := r.abs(r.Endpoints[i], scans[i][j.key].Rel)
+				_ = r.op(i, func() error { return os.Chtimes(p, mt, mt) })
 			}
 		}
 	}
@@ -1437,7 +1566,7 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 		p := r.abs(r.Endpoints[i], fi.Rel)
 		en.logf(r.Name, "INFO", "удаляю %s", p)
 		if !en.dry {
-			if _, err := en.removeOld(r, i, p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if err := r.op(i, func() error { _, rerr := en.removeOld(r, i, p); return rerr }); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				en.logf(r.Name, "ERROR", "удаление %s: %v", p, err)
 				ps.failed++
 				ok = false
@@ -1446,13 +1575,8 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 		}
 		ps.deleted++
 	}
-	if ok && !j.noBase && !en.dry {
-		if j.winner >= 0 {
-			wi := scans[j.winner][j.key]
-			st.setBase(j.key, Base{Size: wi.Size, MTime: wi.MTime})
-		} else {
-			st.delBase(j.key)
-		}
+	if ok && !j.noBase && !en.dry && j.winner < 0 {
+		st.delBase(j.key)
 	}
 	return ok
 }
@@ -1489,26 +1613,35 @@ func createTemp(r *Rule, dstPath string) (*os.File, string, error) {
 	return nil, "", errors.New("не удалось подобрать имя временного файла")
 }
 
-func (en *Engine) copyFile(r *Rule, srcPath string, wi FInfo, di int, dstPath string) error {
+func (en *Engine) copyFile(r *Rule, si int, srcPath string, wi FInfo, di int, dstPath string) error {
 	if en.dry {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+	if err := r.op(di, func() error { return os.MkdirAll(filepath.Dir(dstPath), 0o755) }); err != nil {
 		return err
 	}
 	if r.DirectKB > 0 && wi.Size <= int64(r.DirectKB)*1024 {
-		return en.copyDirect(r, srcPath, wi, di, dstPath)
+		return en.copyDirect(r, si, srcPath, wi, di, dstPath)
 	}
 	in, err := os.Open(srcPath)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, tmp, err := createTemp(r, dstPath)
-	if err != nil {
+	var out *os.File
+	var tmp string
+	if err := r.op(di, func() (cerr error) { out, tmp, cerr = createTemp(r, dstPath); return }); err != nil {
 		return err
 	}
-	_, err = io.Copy(out, in)
+	if stall := maxDur(r.stall(si), r.stall(di)); stall > 0 {
+		err = copyStall(out, in, stall)
+		if errors.Is(err, errStalled) {
+			go os.Remove(tmp) // может зависнуть вместе с диском — не ждём
+			return err
+		}
+	} else {
+		_, err = io.Copy(out, in)
+	}
 	if err == nil {
 		err = out.Sync()
 	}
@@ -1525,26 +1658,98 @@ func (en *Engine) copyFile(r *Rule, srcPath string, wi FInfo, di int, dstPath st
 		return errSourceChanged
 	}
 	mt := time.Unix(0, wi.MTime)
-	if err := os.Chtimes(tmp, mt, mt); err != nil {
+	if err := r.op(di, func() error { return os.Chtimes(tmp, mt, mt) }); err != nil && r.mtimeReliable(di) {
 		os.Remove(tmp)
 		return err
 	}
-	if _, err := os.Lstat(dstPath); err == nil {
-		if _, err := en.removeOld(r, di, dstPath); err != nil {
-			os.Remove(tmp)
-			return err
+	if err := r.op(di, func() error {
+		if _, lerr := os.Lstat(dstPath); lerr == nil {
+			_, rerr := en.removeOld(r, di, dstPath)
+			return rerr
 		}
+		return nil
+	}); err != nil {
+		os.Remove(tmp)
+		return err
 	}
-	if err := os.Rename(tmp, dstPath); err != nil {
+	if err := r.op(di, func() error { return os.Rename(tmp, dstPath) }); err != nil {
 		os.Remove(tmp)
 		return err
 	}
 	return nil
 }
 
+func maxDur(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// guardOp выполняет fn и возвращает errStalled, если ответа нет дольше d.
+// Зависшая операция остаётся в своей горутине (прервать вызов файловой системы нельзя).
+func guardOp(d time.Duration, fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		return errStalled
+	}
+}
+
+// copyStall копирует данные кусками и прерывается, если движения нет дольше stall
+// (оборвалась сеть, завис rclone/sshfs).
+func copyStall(dst, src *os.File, stall time.Duration) error {
+	var prog atomic.Int64
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 256<<10)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					done <- werr
+					return
+				}
+				prog.Add(int64(n))
+			}
+			if err == io.EOF {
+				done <- nil
+				return
+			}
+			if err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+	last, lastT := int64(-1), time.Now()
+	tk := time.NewTicker(time.Second)
+	defer tk.Stop()
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-tk.C:
+			if p := prog.Load(); p != last {
+				last, lastT = p, time.Now()
+			} else if time.Since(lastT) > stall {
+				src.Close()
+				dst.Close()
+				return errStalled
+			}
+		}
+	}
+}
+
 // copyDirect — малые файлы: читаем в память и пишем сразу в целевой файл, без временного.
-func (en *Engine) copyDirect(r *Rule, srcPath string, wi FInfo, di int, dstPath string) error {
-	data, err := os.ReadFile(srcPath)
+func (en *Engine) copyDirect(r *Rule, si int, srcPath string, wi FInfo, di int, dstPath string) error {
+	var data []byte
+	err := r.op(si, func() (rerr error) { data, rerr = os.ReadFile(srcPath); return })
 	if err != nil {
 		return err
 	}
@@ -1553,26 +1758,32 @@ func (en *Engine) copyDirect(r *Rule, srcPath string, wi FInfo, di int, dstPath 
 		return errSourceChanged
 	}
 	mt := time.Unix(0, wi.MTime)
+	setTime := func() error {
+		if err := r.op(di, func() error { return os.Chtimes(dstPath, mt, mt) }); err != nil && r.mtimeReliable(di) {
+			return err
+		}
+		return nil
+	}
 	trashed := ""
 	if _, lerr := os.Lstat(dstPath); lerr == nil {
 		if r.TrashDays < 0 {
-			if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+			if err := r.op(di, func() error { return os.WriteFile(dstPath, data, 0o644) }); err != nil {
 				return err
 			}
-			return os.Chtimes(dstPath, mt, mt)
+			return setTime()
 		}
-		if trashed, err = en.removeOld(r, di, dstPath); err != nil {
+		if err := r.op(di, func() (rerr error) { trashed, rerr = en.removeOld(r, di, dstPath); return }); err != nil {
 			return err
 		}
 	}
-	if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+	if err := r.op(di, func() error { return os.WriteFile(dstPath, data, 0o644) }); err != nil {
 		_ = os.Remove(dstPath)
 		if trashed != "" {
 			_ = os.Rename(trashed, dstPath) // вернуть прежнюю версию
 		}
 		return err
 	}
-	return os.Chtimes(dstPath, mt, mt)
+	return setTime()
 }
 
 // moveFile переносит файл; если Rename невозможен (другой том) — копирует и удаляет исходный.
@@ -1692,4 +1903,30 @@ func cleanWorkTmp(r *Rule) {
 		}
 		return nil
 	})
+}
+
+// skipCaseCollisions исключает из плана файлы, имена которых различаются только регистром:
+// Windows-программы (и rclone/sshfs на Windows) не различают их при открытии, и можно перезаписать не тот файл.
+func (en *Engine) skipCaseCollisions(r *Rule, rt *ruleRT, jobs []*job) []*job {
+	skip := map[string]bool{}
+	for i, c := range rt.cache {
+		for k, rels := range c.coll {
+			skip[k] = true
+			if !rt.notified["case:"+k] {
+				rt.notified["case:"+k] = true
+				en.logf(r.Name, "WARN", "файлы отличаются только регистром, пропущены: %s (путь №%d). Схема меток [linux_case] появится в следующей версии", strings.Join(rels, " | "), i+1)
+				en.notify(r, "Конфликт имён", "Файлы отличаются только регистром и пропущены: "+rels[0])
+			}
+		}
+	}
+	if len(skip) == 0 {
+		return jobs
+	}
+	out := jobs[:0:0]
+	for _, j := range jobs {
+		if !skip[j.key] {
+			out = append(out, j)
+		}
+	}
+	return out
 }

@@ -9,3 +9,5 @@
 Опции правила: `mode`, `master`, `conflict`, `notify`, `ignore`, `TrashDays`, `scan`, `recursive`,
 `MaxDeletePercent`, `DeleteExtra`, `watch`, `debounce`, `marker`, `nomarker`, `enabled`.
 Подробности — в `LocalSyncExt.ini` и `CHANGELOG.md`.
+
+Сетевые диски и облака: у пути можно указать тип (`remote=`, `cloud=`), см. страницу «Справка» веб-интерфейса.

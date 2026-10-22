@@ -68,7 +68,7 @@ function errText(e) {
 // ---------- оболочка страницы ----------
 function shell(active, ...content) {
   const link = (href, text, key) => h('a', { href, class: active === key ? 'active' : '' }, text);
-  const nav = h('nav', {}, link('#/', 'Правила', 'rules'), link('#/status', 'Статус и журнал', 'status'), link('#/settings', 'Настройки', 'settings'));
+  const nav = h('nav', {}, link('#/', 'Правила', 'rules'), link('#/status', 'Статус и журнал', 'status'), link('#/settings', 'Настройки', 'settings'), link('#/help', 'Справка', 'help'));
   const top = h('header', { class: 'top' }, h('span', { class: 'brand' }, 'LocalSyncExt'), nav);
   if (S.me && S.me.auth) {
     top.append(h('span', { class: 'who' }, S.me.user), h('button', { class: 'small', onclick: logout }, 'Выйти'));
@@ -228,6 +228,8 @@ const OPT_SPECS = [
   { k: 'maxdeletepercent', label: 'Защита от массового удаления, %', t: 'num', adv: true, ph: '50' },
   { k: 'deleteextra', label: 'Удалять лишнее (для одностороннего)', t: 'bool', adv: true, def: 'Да' },
   { k: 'marker', label: 'Маркер в папках', t: 'bool', adv: true, def: 'Да', hint: 'Отметки «без маркера» ставятся у конкретных путей выше.' },
+  { k: 'mtimetol', label: 'Допуск времени изменения, секунд', t: 'num', adv: true, ph: '2', hint: 'Файлы с разницей во времени не больше этого считаются одинаковыми.' },
+  { k: 'timeout', label: 'Ждать ответа удалённого диска, секунд', t: 'num', adv: true, ph: '60 для сетевого, 180 для облака', hint: 'Если диск не отвечает дольше, правило приостанавливается, ничего не удаляя.' },
   { k: 'debounce', label: 'Пауза накопления событий, мс', t: 'num', adv: true, ph: '1500' },
   { k: 'trash', label: 'Где хранить корзину', t: 'text', adv: true, ph: 'folder | work | полный путь' },
   { k: 'temp', label: 'Временные файлы больших файлов', t: 'sel', adv: true, opts: [['prefix', 'Рядом, с приставкой LocalSyncExt-…'], ['work', 'В рабочей папке (только на том же диске)']], def: 'рядом' },
@@ -283,14 +285,17 @@ async function pageRule(name) {
   S.version = S.version || '';
   const isNew = name === null;
   let R;
-  if (isNew) R = { name: '', desc: '', opts: {}, paths: [{ p: '', nm: false }, { p: '', nm: false }] };
+  if (isNew) R = { name: '', desc: '', opts: {}, paths: [{ p: '', nm: false, kind: 'local' }, { p: '', nm: false, kind: 'local' }] };
   else {
     const src = cfg.rules.find((r) => r.name === name);
     if (!src) { errorPage(new Error('Правило «' + name + '» не найдено в конфиге')); return; }
     const opts = {}; for (const kv of src.opts) opts[kv.k] = kv.v;
     const nm = new Set((opts.nomarker || '').split(/[,; ]+/).filter(Boolean).map((x) => parseInt(x, 10) - 1));
     delete opts.nomarker;
-    R = { name: src.name, desc: src.desc, opts, paths: src.paths.map((p, i) => ({ p, nm: nm.has(i) })) };
+    const idxSet = (v) => new Set((v || '').split(/[,; ]+/).filter(Boolean).map((x) => parseInt(x, 10) - 1));
+    const rem = idxSet(opts.remote), cld = idxSet(opts.cloud);
+    delete opts.remote; delete opts.cloud;
+    R = { name: src.name, desc: src.desc, opts, paths: src.paths.map((p, i) => ({ p, nm: nm.has(i), kind: cld.has(i) ? 'cloud' : rem.has(i) ? 'remote' : 'local' })) };
     if (src.err) R.configErr = src.err;
   }
   const errBox = h('div');
@@ -304,10 +309,14 @@ async function pageRule(name) {
       const inp = h('input', { type: 'text', value: pr.p, placeholder: 'C:\\папка, C:\\файл.txt или C:\\папка\\*.pdf', oninput: (e) => { pr.p = e.target.value; } });
       pathsBox.append(h('div', { class: 'pathrow' },
         h('span', { class: 'num' }, '№' + (i + 1)), inp,
+        h('select', { title: 'Тип диска: от него зависят слежение, таймауты и сравнение времени изменения', onchange: (e) => { pr.kind = e.target.value; } },
+          h('option', { value: 'local', selected: pr.kind === 'local' }, 'Локальный'),
+          h('option', { value: 'remote', selected: pr.kind === 'remote' }, 'Сетевой (sshfs, SMB)'),
+          h('option', { value: 'cloud', selected: pr.kind === 'cloud' }, 'Облако (rclone)')),
         h('button', { class: 'small', onclick: () => fileBrowser({ title: 'Путь №' + (i + 1), start: pr.p, onDone: (v) => {
           if (!v.length) return;
           pr.p = v[0];
-          R.paths.splice(i + 1, 0, ...v.slice(1).map((p) => ({ p, nm: false })));
+          R.paths.splice(i + 1, 0, ...v.slice(1).map((p) => ({ p, nm: false, kind: pr.kind })));
           renderPaths(); renderOpts();
         } }) }, 'Обзор…'),
         h('button', { class: 'small', disabled: i === 0, onclick: () => { [R.paths[i - 1], R.paths[i]] = [R.paths[i], R.paths[i - 1]]; renderPaths(); renderOpts(); } }, '↑'),
@@ -336,6 +345,9 @@ async function pageRule(name) {
     const nonEmpty = R.paths.filter((pr) => pr.p.trim());
     const nm2 = nonEmpty.map((pr, i) => (pr.nm ? i + 1 : 0)).filter(Boolean);
     if (nm2.length) opts.push({ k: 'nomarker', v: nm2.join(',') });
+    const idx = (kind) => nonEmpty.map((pr, i) => (pr.kind === kind ? i + 1 : 0)).filter(Boolean).join(',');
+    if (idx('remote')) opts.push({ k: 'remote', v: idx('remote') });
+    if (idx('cloud')) opts.push({ k: 'cloud', v: idx('cloud') });
     return { name: R.name.trim(), desc: R.desc.trim(), opts, paths: nonEmpty.map((pr) => pr.p.trim()) };
   }
   async function save() {
@@ -377,9 +389,9 @@ async function pageRule(name) {
       h('div', { class: 'muted', style: 'font-size:13px;margin-bottom:6px' }, 'Папка, отдельный файл или маска (D:\\Docs\\*.pdf). Содержимое всех путей правила приводится к одному виду. Пути вводятся вручную, вставляются или выбираются кнопкой «Обзор…» — путь на компьютере, где работает программа.'),
       pathsBox,
       h('div', { class: 'row', style: 'margin-top:8px' },
-        h('button', { onclick: () => { R.paths.push({ p: '', nm: false }); renderPaths(); renderOpts(); } }, '＋ Путь'),
+        h('button', { onclick: () => { R.paths.push({ p: '', nm: false, kind: 'local' }); renderPaths(); renderOpts(); } }, '＋ Путь'),
         h('button', { onclick: () => fileBrowser({ title: 'Добавить файлы и папки', start: '', onDone: (v) => {
-          for (const p of v) { const empty = R.paths.find((x) => !x.p.trim()); if (empty) empty.p = p; else R.paths.push({ p, nm: false }); }
+          for (const p of v) { const empty = R.paths.find((x) => !x.p.trim()); if (empty) empty.p = p; else R.paths.push({ p, nm: false, kind: 'local' }); }
           renderPaths(); renderOpts();
         } }) }, '＋ Обзор (можно несколько)…'))),
     h('div', { class: 'panel' }, h('h3', { style: 'margin-top:0' }, 'Параметры'), optsBox,
@@ -525,6 +537,54 @@ async function pageSettings() {
       credBox, h('button', { onclick: saveCred }, 'Сохранить логин и пароль')));
 }
 
+// ---------- справка ----------
+const HELP = [
+  { t: 'Как это работает', p: [
+    'Правило объединяет два и больше путей: папки, отдельные файлы или маски (D:\\Docs\\*.pdf). В двустороннем режиме изменение в любом пути доходит до остальных, в одностороннем остальные пути становятся копией главного.',
+    'Удалённые и заменённые файлы попадают в корзину (по умолчанию .LocalSyncTrash в папке, хранится 30 дней). Конфликты (файл изменён сразу в нескольких местах) решаются автоматически: побеждает более новая версия, проигравшая сохраняется рядом как имя.sync-conflict-ДАТА-ВРЕМЯ-ДИСК.расширение и тоже синхронизируется.'] },
+  { t: 'Типы путей', p: ['Тип выбирается у каждого пути правила. От него зависит, как программа следит за изменениями и каким данным диска можно доверять.'],
+    l: [
+      'Локальный — обычный диск. Изменения подхватываются сразу (слежение Windows), время изменения надёжно.',
+      'Сетевой (sshfs-win, SMB) — события об изменениях, сделанных с другой стороны, обычно не приходят, поэтому путь проверяется по таймеру (по умолчанию раз в 2 минуты). Включён контроль зависания: если диск не отвечает дольше 60 с, правило приостанавливается, ничего не удаляя, и повторяет попытки с нарастающей паузой (до 10 минут).',
+      'Облако (rclone mount, bclone) — как сетевой, но время изменения в облаке не используется: изменения определяются по размеру файла (по документации rclone, например Mega не позволяет задать время изменения). Проверка раз в 10 минут, ожидание ответа 180 с. При конфликте побеждает версия с надёжным временем (локальная), облачная сохраняется копией. Ограничение: правка облачного файла без изменения размера не будет замечена.'] },
+  { t: 'Советы для rclone mount и sshfs-win', l: [
+    'У rclone каталог кэшируется (--dir-cache-time, по умолчанию 5 минут), поэтому чужие изменения видны с задержкой; период сканирования правила (scan) не делайте короче. Для облаков, умеющих уведомлять об изменениях, помогает --poll-interval.',
+    '--vfs-write-back (по умолчанию 5 с) откладывает загрузку записанных файлов в облако: файл локально виден сразу, в облаке появится позже. Это нормально.',
+    '--network-mode показывает диск как сетевой. Определение типа в программе от этого не зависит: тип задаётся вручную у пути.',
+    'Облако Mega (по документации rclone) различает регистр имён и допускает несколько файлов с одинаковым именем; дубликаты лечатся командой rclone dedupe. Свойства Terabox (bclone) документированы хуже, поэтому для него тоже выбирайте «Облако».',
+    'sshfs-win: права и владелец файлов через Windows недоступны, поэтому сохранение прав Linux возможно только при прямом SFTP (планируется).',
+    'Маркер (служебный файл в корне пути, защита от подмены диска) можно отключить отметкой «без маркера» у пути. Для облаков корзину удобно выносить из облака: Trash=work.'] },
+  { t: 'Защита данных', l: [
+    'Если путь недоступен, не отвечает, потерял маркер или у диска изменился серийный номер, правило приостанавливается и ничего не удаляет.',
+    'Если за один проход нужно удалить больше MaxDeletePercent файлов (по умолчанию 50%), проход отменяется.',
+    'Свежие файлы (изменённые менее 2 секунд назад) пропускаются до следующего прохода. Копирование идёт через временный файл с проверкой, что исходник не менялся.'] },
+  { t: 'Имена, отличающиеся только регистром', p: [
+    'Сейчас: если в одной папке лежат файлы, которые различаются только регистром (на Linux, в облаке Mega), программа их пропускает и пишет предупреждение: Windows не различает такие имена при открытии, и можно перезаписать не тот файл. Остальные файлы синхронизируются.',
+    'Планируется (при прямом SFTP, где доступ к файлам точный). Схема меток для копирования Linux → Windows, программа будет понимать её и в обратную сторону, и для других Linux/Android-устройств:'],
+    l: ['Файл, отличающийся регистром от другого: file.ext, File.ext, FILE.ext, fIlE.ext → на Windows file.ext, File[linux_case].ext, FILE[linux_case].ext, fIlE[linux_case].ext.',
+      'Отличается только расширение: another_file.ext, another_file.EXT, another_file.Ext → another_file.ext, another_file.EXT.ext, another_file.Ext.ext.',
+      'Метка нужна только при совпадении имён без учёта регистра; обычные файлы (README.md) метки не получают. При обратной синхронизации Windows → Linux метки распознаются и убираются.'] },
+  { t: 'Права и владелец на Linux (планируется)', p: ['При прямом SFTP обновлённый файл будет получать те же права и владельца, что были у заменяемого (например, исполняемый останется исполняемым).'] },
+  { t: 'Параметры правила', l: [
+    'mode (twoway/oneway), master — режим и главный путь; conflict (auto/ask); TrashDays (число дней, 0 — бессрочно, пусто — без корзины).',
+    'scan — период полного сканирования, секунд (0 — выключено); watch — мгновенное слежение; debounce — пауза накопления событий, мс; recursive — вложенные папки.',
+    'remote, cloud — номера путей сетевых/облачных дисков (например cloud=1,3); nomarker — пути без маркера; mtimetol — допуск времени, секунд; timeout — ожидание ответа удалённого диска, секунд.',
+    'ignore — маски игнорируемых файлов через «;»; MaxDeletePercent; DeleteExtra; Trash (folder, work или путь); Temp (prefix, work); DirectBelow (КБ); notify; enabled.'] },
+  { t: 'Веб-интерфейс', l: [
+    'Порт без авторизации (WebPortOpen, по умолчанию 20001, слушает 127.0.0.1) предназначен для доверенных сетей. Любой, кто до него дотянется, может менять правила и просматривать файлы компьютера: закройте его брандмауэром от посторонних.',
+    'Порт с логином и паролем (WebPortAuth) выдаёт cookie на 30 дней. Логин и пароль задаются на странице настроек или командой LocalSyncExt-cli.exe -web-user ИМЯ -web-pass ПАРОЛЬ.',
+    'Все изменения через веб проверяются и применяются без перезапуска; предыдущий ini сохраняется как .ini.bak.'] },
+  { t: 'Значок в трее', l: [
+    'Зелёный — работа, жёлтый/зелёный мигают — идёт синхронизация, красный — пауза, зелёный с красной точкой — есть ошибки.',
+    'Правая кнопка — меню; действия левого щелчка и двойного настраиваются (TrayClick, TrayDoubleClick); период мигания — TrayBlinkMs.'] },
+];
+function pageHelp() {
+  const sections = HELP.map((sec) => h('div', { class: 'panel' }, h('h3', { style: 'margin-top:0' }, sec.t),
+    ...(sec.p || []).map((p) => h('p', { style: 'margin:6px 0' }, p)),
+    sec.l ? h('ul', { style: 'margin:6px 0;padding-left:20px' }, ...sec.l.map((x) => h('li', { style: 'margin:4px 0' }, x))) : null));
+  shell('help', h('h2', {}, 'Справка'), ...sections);
+}
+
 // ---------- маршрутизация ----------
 async function route() {
   clearTimers();
@@ -552,6 +612,7 @@ async function route() {
     else if (hash === '/rule-new') await pageRule(null);
     else if (hash === '/status') await pageStatus();
     else if (hash === '/settings') await pageSettings();
+    else if (hash === '/help') pageHelp();
     else await pageRules();
   } catch (e) {
     if (e.status === 401) { S.me = null; location.hash = '#/login'; return; }

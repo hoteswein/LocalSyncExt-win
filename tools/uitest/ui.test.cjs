@@ -89,12 +89,22 @@ const type = (w, el, v) => { el.value = v; el.dispatchEvent(new w.Event('input',
   modeSel.value = 'oneway'; modeSel.dispatchEvent(new w.Event('change'));
   await until(w, () => byText(w, 'label', 'Главный путь'), 'поле «Главный путь» для одностороннего режима');
   $$(w, '.pathrow input[type=checkbox]')[1].checked = true; $$(w, '.pathrow input[type=checkbox]')[1].dispatchEvent(new w.Event('change'));
+  const kindSel = $$(w, '.pathrow select')[1];
+  kindSel.value = 'cloud'; kindSel.dispatchEvent(new w.Event('change'));
   const trash = $$(w, 'select').find((s) => [...s.options].some((o) => o.value === 'forever'));
   trash.value = 'none'; trash.dispatchEvent(new w.Event('change'));
   byText(w, 'button', 'Сохранить').click();
   await until(w, () => fs.readFileSync(ini, 'utf8').includes('[Тестовое]'), 'новое правило в ini', 8000);
   const t2 = fs.readFileSync(ini, 'utf8');
-  ok(/mode=oneway/.test(t2) && /NoMarker=2/.test(t2) && /TrashDays=\r?\n/.test(t2), 'опции нового правила записаны (oneway, NoMarker=2, TrashDays=пусто)');
+  ok(/mode=oneway/.test(t2) && /NoMarker=2/.test(t2) && /TrashDays=\r?\n/.test(t2) && /Cloud=2/.test(t2), 'опции нового правила записаны (oneway, NoMarker=2, TrashDays=пусто, Cloud=2)');
+  // справка
+  w.location.hash = '#/help';
+  await until(w, () => byText(w, 'h3', 'Типы путей'), 'страница справки');
+  ok(!!byText(w, 'h3', 'Имена, отличающиеся только регистром') && /\[linux_case\]/.test($(w, 'main').textContent), 'в справке описана схема меток [linux_case]');
+  // повторно открыть правило: тип пути «облако» читается из ini
+  w.location.hash = '#/rule/' + encodeURIComponent('Тестовое');
+  await until(w, () => $$(w, '.pathrow select')[1], 'редактор сохранённого правила');
+  ok($$(w, '.pathrow select')[1].value === 'cloud', 'тип пути «облако» восстановлен из ini');
 
   // статус и журнал
   w.location.hash = '#/status';

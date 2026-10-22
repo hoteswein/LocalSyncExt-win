@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Строка-путь: "C:\..." или "C:/..." или UNC "\\..." или "/..." (для тестов на Linux).
@@ -43,6 +44,10 @@ type Rule struct {
 	Enabled      bool
 	Marker       bool         // маркер-файл в папках (по умолчанию да)
 	NoMarker     map[int]bool // пути (с 0), для которых маркер отключён
+	Remote       map[int]bool // сетевые диски (sshfs-win, SMB): события не используем, нужны таймауты
+	Cloud        map[int]bool // облака через rclone mount: время изменения ненадёжно, сравниваем по размеру
+	MtimeTol     int          // допуск сравнения времени изменения, секунд
+	Timeout      int          // сколько секунд ждать ответа удалённого диска (0 — по умолчанию для типа)
 	Watch        bool         // мгновенное слежение за изменениями
 	ScanSet      bool         // scan задан явно
 	Debounce     int          // мс, пауза накопления событий
@@ -79,7 +84,7 @@ func newRule(name string) *Rule {
 		Name: name, Mode: "twoway", Conflict: "auto", Notify: true,
 		TrashDays: 30, Scan: 60, Recursive: true, MaxDeletePct: 50,
 		DeleteExtra: true, Enabled: true, Marker: true, Watch: true, Debounce: 1500,
-		NoMarker: map[int]bool{}, DirectKB: -1,
+		NoMarker: map[int]bool{}, Remote: map[int]bool{}, Cloud: map[int]bool{}, MtimeTol: 2, DirectKB: -1,
 	}
 }
 
@@ -142,15 +147,38 @@ func (r *Rule) setOption(k, v string, cfg *Config) {
 		case "watch":
 			r.Watch = b
 		}
-	case "nomarker":
+	case "nomarker", "remote", "cloud":
+		set := map[int]bool{}
 		for _, p := range strings.FieldsFunc(v, func(c rune) bool { return c == ',' || c == ';' || c == ' ' }) {
 			n, err := strconv.Atoi(p)
 			if err != nil || n < 1 {
-				r.fail("nomarker=%q: нужны номера путей правила, начиная с 1 (например 2,3)", v)
+				r.fail("%s=%q: нужны номера путей правила, начиная с 1 (например 2,3)", k, v)
 				return
 			}
-			r.NoMarker[n-1] = true
+			set[n-1] = true
 		}
+		switch k {
+		case "nomarker":
+			r.NoMarker = set
+		case "remote":
+			r.Remote = set
+		case "cloud":
+			r.Cloud = set
+		}
+	case "mtimetol":
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 3600 {
+			r.fail("mtimetol=%q: нужно число секунд 0..3600", v)
+			return
+		}
+		r.MtimeTol = n
+	case "timeout":
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 10 || n > 86400 {
+			r.fail("timeout=%q: нужно число секунд 10..86400", v)
+			return
+		}
+		r.Timeout = n
 	case "trash":
 		if v != "folder" && v != "work" && !pathLineRe.MatchString(v) {
 			r.fail("trash=%q: допустимо folder, work или полный путь", v)
@@ -291,10 +319,15 @@ func ParseConfigText(text string) (*Config, error) {
 	cfg.applyDefaults()
 	for _, r := range cfg.Rules {
 		if !r.ScanSet {
-			// при наблюдателе полное сканирование нужно лишь как страховка
-			if r.Watch {
+			// Облако и сетевые диски не присылают событий о чужих изменениях, а сканирование по сети дорогое.
+			switch {
+			case len(r.Cloud) > 0:
+				r.Scan = 600
+			case len(r.Remote) > 0:
+				r.Scan = 120
+			case r.Watch: // при наблюдателе полное сканирование нужно лишь как страховка
 				r.Scan = 900
-			} else {
+			default:
 				r.Scan = 60
 			}
 		}
@@ -400,6 +433,22 @@ func (c *Config) Validate() {
 			if i >= len(r.Endpoints) {
 				r.fail("nomarker: пути №%d нет в правиле", i+1)
 			}
+		}
+		for i := range r.Remote {
+			if i >= len(r.Endpoints) {
+				r.fail("remote: пути №%d нет в правиле", i+1)
+			}
+			if r.Cloud[i] {
+				r.fail("путь №%d указан и в remote, и в cloud", i+1)
+			}
+		}
+		for i := range r.Cloud {
+			if i >= len(r.Endpoints) {
+				r.fail("cloud: пути №%d нет в правиле", i+1)
+			}
+		}
+		if r.Scan == 0 && (len(r.Remote) > 0 || len(r.Cloud) > 0) {
+			c.Warnings = append(c.Warnings, fmt.Sprintf("[%s] scan=0 при сетевых путях: изменения на удалённой стороне не будут обнаруживаться", r.Name))
 		}
 		r.prepare()
 	}
@@ -533,6 +582,7 @@ func (r *Rule) sig() string {
 	fmt.Fprintf(&sb, "%s|%s|%d|%s|%t|%q|%d|%d|%t|%d|%t|%t|%t|%v|%d", r.Name, r.Mode, r.Master, r.Conflict,
 		r.Notify, r.Ignore, r.TrashDays, r.Scan, r.Recursive, r.MaxDeletePct, r.DeleteExtra,
 		r.Marker, r.Watch, r.NoMarker, r.Debounce)
+	fmt.Fprintf(&sb, "|%v|%v|%d|%d", r.Remote, r.Cloud, r.MtimeTol, r.Timeout)
 	fmt.Fprintf(&sb, "|%s|%s|%d|%s", r.TrashPlace, r.TempMode, r.DirectKB, r.workDir)
 	for _, e := range r.Endpoints {
 		sb.WriteString("|" + e.Raw)
@@ -552,7 +602,7 @@ func (r *Rule) record(k, v string) {
 }
 
 var canonKeys = map[string]string{
-	"trashdays": "TrashDays", "maxdeletepercent": "MaxDeletePercent", "deleteextra": "DeleteExtra",
+	"trashdays": "TrashDays", "mtimetol": "MtimeTol", "timeout": "Timeout", "remote": "Remote", "cloud": "Cloud", "maxdeletepercent": "MaxDeletePercent", "deleteextra": "DeleteExtra",
 	"directbelow": "DirectBelow", "nomarker": "NoMarker", "trayclick": "TrayClick",
 	"traydoubleclick": "TrayDoubleClick", "trayblinkms": "TrayBlinkMs", "workdir": "WorkDir", "logfile": "LogFile",
 	"statedir": "StateDir", "webui": "WebUI", "webportopen": "WebPortOpen", "webportauth": "WebPortAuth",
@@ -597,4 +647,43 @@ func (c *Config) Render() string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// kind — тип пути №i: local, remote (сетевой диск) или cloud (облако через rclone mount).
+func (r *Rule) kind(i int) string {
+	switch {
+	case r.Cloud[i]:
+		return "cloud"
+	case r.Remote[i]:
+		return "remote"
+	}
+	return "local"
+}
+
+// mtimeReliable: можно ли доверять времени изменения на этом пути (у облака оно часто не сохраняется).
+func (r *Rule) mtimeReliable(i int) bool { return !r.Cloud[i] }
+
+// tol — допуск сравнения времени изменения в наносекундах.
+func (r *Rule) tol() int64 { return int64(time.Duration(r.MtimeTol) * time.Second) }
+
+// stall — сколько ждать ответа от пути (0 — не контролировать, это локальный диск).
+func (r *Rule) stall(i int) time.Duration {
+	if r.kind(i) == "local" {
+		return 0
+	}
+	if r.Timeout > 0 {
+		return time.Duration(r.Timeout) * time.Second
+	}
+	if r.Cloud[i] {
+		return 180 * time.Second
+	}
+	return 60 * time.Second
+}
+
+// op выполняет операцию над путём №i; для удалённых путей — с ограничением времени ожидания.
+func (r *Rule) op(i int, fn func() error) error {
+	if d := r.stall(i); d > 0 {
+		return guardOp(d, fn)
+	}
+	return fn()
 }
