@@ -93,7 +93,7 @@ func TestCloudDetectsBySize(t *testing.T) {
 	// конфликт: локальная версия (надёжное время) побеждает, облачная сохраняется копией
 	wr(t, filepath.Join(a, "x.txt"), "LOCAL-edit-1", 5*time.Minute)
 	wr(t, filepath.Join(b, "x.txt"), "CLOUD-edit-longer", 0) // время «новее», но облаку верить нельзя
-	time.Sleep(2200 * time.Millisecond)                // файл с «текущим» временем сначала считается ещё пишущимся
+	time.Sleep(2200 * time.Millisecond)                      // файл с «текущим» временем сначала считается ещё пишущимся
 	en.RunOnce()
 	if rd(t, filepath.Join(a, "x.txt")) != "LOCAL-edit-1" || rd(t, filepath.Join(b, "x.txt")) != "LOCAL-edit-1" {
 		t.Fatalf("при конфликте должна победить локальная версия: a=%q b=%q", rd(t, filepath.Join(a, "x.txt")), rd(t, filepath.Join(b, "x.txt")))
