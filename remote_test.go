@@ -174,7 +174,9 @@ func TestGuardsAgainstHang(t *testing.T) {
 	// копирование, из которого не приходят данные
 	pr, pw, _ := os.Pipe()
 	defer pw.Close()
+	defer pr.Close()
 	dst, _ := os.CreateTemp(t.TempDir(), "x")
+	defer dst.Close()
 	start = time.Now()
 	if err := copyStall(dst, pr, 500*time.Millisecond); err != errStalled {
 		t.Fatalf("copyStall должен прерваться: %v", err)
@@ -188,9 +190,12 @@ func TestGuardsAgainstHang(t *testing.T) {
 	os.WriteFile(srcF, data, 0o644)
 	in, _ := os.Open(srcF)
 	out, _ := os.Create(filepath.Join(t.TempDir(), "d"))
+	defer in.Close()
+	defer out.Close()
 	if err := copyStall(out, in, time.Minute); err != nil {
 		t.Fatal(err)
 	}
+	out.Close()
 	got, _ := os.ReadFile(out.Name())
 	if !bytes.Equal(got, data) {
 		t.Fatal("данные при копировании искажены")
