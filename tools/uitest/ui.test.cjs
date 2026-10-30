@@ -117,6 +117,12 @@ const type = (w, el, v) => { el.value = v; el.dispatchEvent(new w.Event('input',
   // настройки
   w.location.hash = '#/settings';
   await until(w, () => byText(w, 'h3', 'Веб-интерфейс'), 'страница настроек');
+  await until(w, () => byText(w, 'h3', 'Подключения SSH/SFTP'), 'панель подключений');
+  ok(!!byText(w, 'b', 'nas') && !!byText(w, '.badge', 'отпечаток не подтверждён'), 'подключение nas показано как неподтверждённое');
+  byText(w, 'button', 'Изменить').click();
+  await until(w, () => $(w, '.modal'), 'окно правки подключения');
+  ok($$(w, '.modal input[type=text]').some((i) => i.value === '10.0.0.5'), 'в форме подключения видны данные сервера');
+  byText(w, '.modal button', 'Отмена').click();
   const tc = $$(w, 'select').find((s) => [...s.options].some((o) => o.value === 'syncnow') && s.previousSibling);
   tc.value = 'pause'; tc.dispatchEvent(new w.Event('change'));
   byText(w, 'button', 'Сохранить настройки').click();

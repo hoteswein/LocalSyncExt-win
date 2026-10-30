@@ -109,6 +109,9 @@ func TestObservedMtimeInBase(t *testing.T) {
 	_, cfg := setup(t, "[R1]\nscan=0\nwatch=0\n{R}/a\n{R}/b\n")
 	r := cfg.Rules[0]
 	r.prepare()
+	for _, e := range r.Endpoints {
+		e.FS = theLocalFS
+	}
 	en := NewEngine(cfg, t.TempDir(), false, io.Discard)
 	T := time.Now().Add(-24 * time.Hour).UnixNano()
 	shifted := T + int64(time.Hour)
@@ -191,5 +194,46 @@ func TestGuardsAgainstHang(t *testing.T) {
 	got, _ := os.ReadFile(out.Name())
 	if !bytes.Equal(got, data) {
 		t.Fatal("данные при копировании искажены")
+	}
+}
+
+func TestConnectionConfig(t *testing.T) {
+	root := t.TempDir()
+	ini := "[Connection nas]\ndescription=Домашний сервер\nhost=192.168.100.13\nport=2222\nuser=root\nkeyfile=" + filepath.ToSlash(root) + "/id\nhostkey=SHA256:abc\n\n" +
+		"[Connection bad]\nhost=x\n\n" +
+		"[R1]\n{R}/a\nsftp://nas/home/u/docs\n[R2]\n{R}/b\nsftp://missing/x\n[R3]\n{R}/c\nsftp://nas/home/u/docs/inner\n"
+	ini = strings.ReplaceAll(ini, "{R}", filepath.ToSlash(root))
+	f := filepath.Join(root, "t.ini")
+	os.WriteFile(f, []byte(ini), 0o644)
+	cfg, err := loadConfig(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Conns) != 2 {
+		t.Fatalf("подключений: %d", len(cfg.Conns))
+	}
+	n := cfg.Conns[0]
+	if n.Host != "192.168.100.13" || n.Port != 2222 || n.User != "root" || n.Auth != "key" || n.HostKey != "SHA256:abc" || n.Desc != "Домашний сервер" || n.Err != "" {
+		t.Fatalf("nas: %+v", n)
+	}
+	if cfg.Conns[1].Err == "" {
+		t.Fatal("подключение без user должно давать ошибку")
+	}
+	if cfg.Rules[0].Err != "" {
+		t.Fatalf("R1: %s", cfg.Rules[0].Err)
+	}
+	if cfg.Rules[1].Err == "" || !strings.Contains(cfg.Rules[1].Err, "missing") {
+		t.Fatalf("R2 должен ссылаться на отсутствующее подключение: %q", cfg.Rules[1].Err)
+	}
+	if cfg.Rules[2].Err == "" {
+		t.Fatal("R3 вложен в путь R1 на том же подключении")
+	}
+	if !strings.Contains(cfg.Rules[0].Endpoints[1].Dir, "/home/u/docs") || cfg.Rules[0].Endpoints[1].Conn != "nas" {
+		t.Fatalf("разбор sftp-пути: %+v", cfg.Rules[0].Endpoints[1])
+	}
+	// запись обратно сохраняет подключения
+	txt := cfg.Render()
+	if !strings.Contains(txt, "[Connection nas]") || !strings.Contains(txt, "hostkey=SHA256:abc") || !strings.Contains(txt, "sftp://nas/home/u/docs") {
+		t.Fatalf("Render потерял подключения:\n%s", txt)
 	}
 }

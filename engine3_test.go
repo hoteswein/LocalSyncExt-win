@@ -124,12 +124,15 @@ func TestWorkDirInsideEndpoint(t *testing.T) {
 	}
 }
 
-func TestMoveFallbackCopy(t *testing.T) {
+// otherFS — «другая» файловая система: перенос на неё идёт копированием, а не переименованием.
+type otherFS struct{ localFS }
+
+func TestMoveBetweenFileSystems(t *testing.T) {
 	d := t.TempDir()
 	src, dst := filepath.Join(d, "s.txt"), filepath.Join(d, "d.txt")
 	wr(t, src, "data", time.Hour)
 	fi, _ := os.Stat(src)
-	if err := copyThenRemove(src, dst, fi); err != nil {
+	if err := moveBetween(theLocalFS, src, otherFS{}, dst); err != nil {
 		t.Fatal(err)
 	}
 	if exists(src) || rd(t, dst) != "data" {

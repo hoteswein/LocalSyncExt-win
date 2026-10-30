@@ -39,6 +39,7 @@ type FInfo struct {
 	Rel   string
 	Size  int64
 	MTime int64
+	Attr  *Attrs // права и владелец (Linux/Android), nil на Windows
 }
 
 // epCache — известное содержимое пути (в памяти), чтобы по событию проверять только изменённое.
@@ -129,11 +130,15 @@ type Engine struct {
 	cfg *Config
 	rt  map[string]*ruleRT
 	run map[string]*running
+	cm  *connMgr
 }
 
 func NewEngine(cfg *Config, stateDir string, dry bool, w io.Writer) *Engine {
-	return &Engine{cfg: cfg, stateDir: stateDir, dry: dry,
+	en := &Engine{cfg: cfg, stateDir: stateDir, dry: dry,
 		out: log.New(w, "", log.Ldate|log.Ltime), rt: map[string]*ruleRT{}, run: map[string]*running{}}
+	en.cm = newConnMgr(stateDir)
+	en.cm.Update(cfg.Conns)
+	return en
 }
 
 func (en *Engine) logf(rule, level, format string, a ...any) {
@@ -382,6 +387,7 @@ func (en *Engine) Apply(cfg *Config) {
 func (en *Engine) applyRules(cfg *Config) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
+	en.cm.Update(cfg.Conns)
 	en.cfg = cfg
 	want := map[string]*Rule{}
 	for _, r := range cfg.Rules {
@@ -687,7 +693,8 @@ type job struct {
 	deletes     []int
 	noBase      bool
 	askConflict bool
-	wi          FInfo // версия победителя на момент планирования (для базы состояния)
+	wi          FInfo  // версия победителя на момент планирования (для базы состояния)
+	attr        *Attrs // права, запомненные в базе (для записи на Linux после обхода через Windows)
 }
 
 type passStats struct{ copied, deleted, conflicts, failed, pending int }
@@ -711,6 +718,10 @@ func (en *Engine) pass(r *Rule, rt *ruleRT, full bool, raws []rawEv, force bool)
 	}()
 
 	r.prepare()
+	if aerr := en.attachFS(r); aerr != nil {
+		return 0, aerr
+	}
+	r.prepare() // теперь можно определить, файл это или папка, и на SFTP-путях
 	if r.Err != "" {
 		return 0, errors.New(r.Err)
 	}
@@ -834,6 +845,18 @@ func (en *Engine) pass(r *Rule, rt *ruleRT, full bool, raws []rawEv, force bool)
 					}
 				}
 			}
+			b.Attr = j.wi.Attr
+			if b.Attr == nil && rt.cache != nil {
+				for i := range r.Endpoints {
+					if f, ok := rt.cache[i].files[j.key]; ok && f.Attr != nil {
+						b.Attr = f.Attr
+						break
+					}
+				}
+			}
+			if b.Attr == nil {
+				b.Attr = j.attr
+			}
 			st.setBase(j.key, b)
 		}
 	}
@@ -878,18 +901,21 @@ func (en *Engine) checkEndpoints(r *Rule, st *State) ([]bool, error) {
 		key := strings.ToLower(e.Raw)
 		id, known := st.IDs[key]
 		joining[i] = !known && len(st.Base) > 0
-		var fi os.FileInfo
+		var fi fs.FileInfo
 		var err error
 		if d := r.stall(i) / 3; d > 0 { // удалённый диск может зависнуть: не ждём вечно
-			err = guardOp(d, func() (serr error) { fi, serr = os.Stat(e.Dir); return })
+			err = guardOp(d, func() (serr error) { fi, serr = e.FS.Stat(e.Dir); return })
 			if errors.Is(err, errStalled) {
 				return nil, fmt.Errorf("%s не отвечает более %v — правило приостановлено до восстановления связи, ничего не удалено", e.Dir, d)
 			}
 		} else {
-			fi, err = os.Stat(e.Dir)
+			fi, err = e.FS.Stat(e.Dir)
 		}
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
+				if e.Conn != "" {
+					return nil, fmt.Errorf("sftp://%s%s: %w", e.Conn, e.Dir, err)
+				}
 				return nil, fmt.Errorf("%s: %w", e.Dir, err)
 			}
 			if known {
@@ -898,14 +924,14 @@ func (en *Engine) checkEndpoints(r *Rule, st *State) ([]bool, error) {
 			if en.dry {
 				continue
 			}
-			if err := os.MkdirAll(e.Dir, 0o755); err != nil {
+			if err := r.op(i, func() error { return e.FS.MkdirAll(e.Dir) }); err != nil {
 				return nil, fmt.Errorf("не удалось создать %s: %w", e.Dir, err)
 			}
 		} else if !fi.IsDir() {
 			return nil, fmt.Errorf("%s — не папка", e.Dir)
 		}
 		vid := ""
-		if r.stall(i) == 0 {
+		if e.FS.Local() && r.stall(i) == 0 {
 			vid = volumeID(e.Dir)
 		}
 		if vid != "" {
@@ -931,9 +957,9 @@ func (en *Engine) checkEndpoints(r *Rule, st *State) ([]bool, error) {
 		if id == "-" {
 			known = false // раньше маркер не использовался — начинаем
 		}
-		marker := filepath.Join(e.Dir, markerName(r.Name))
+		marker := e.FS.Join(e.Dir, markerName(r.Name))
 		var b []byte
-		rerr := r.op(i, func() (xerr error) { b, xerr = os.ReadFile(marker); return })
+		rerr := r.op(i, func() (xerr error) { b, xerr = e.FS.ReadFile(marker); return })
 		if errors.Is(rerr, errStalled) {
 			return nil, fmt.Errorf("%s не отвечает — правило приостановлено", e.Dir)
 		}
@@ -953,7 +979,7 @@ func (en *Engine) checkEndpoints(r *Rule, st *State) ([]bool, error) {
 				continue
 			}
 			nid := randID()
-			if err := os.WriteFile(marker, []byte(nid+"\n"), 0o644); err != nil {
+			if err := r.op(i, func() error { return e.FS.WriteFile(marker, []byte(nid+"\n")) }); err != nil {
 				return nil, fmt.Errorf("не удалось записать маркер в %s: %w", e.Dir, err)
 			}
 			st.setID(key, nid)
@@ -987,9 +1013,9 @@ func ignored(r *Rule, name string) bool {
 }
 
 // removeStaleTemp удаляет «осиротевшие» временные файлы программы старше суток.
-func removeStaleTemp(p string, d fs.DirEntry) {
+func removeStaleTemp(f FileFS, p string, d fs.DirEntry) {
 	if info, err := d.Info(); err == nil && time.Since(info.ModTime()) > 24*time.Hour {
-		_ = os.Remove(p)
+		_ = f.Remove(p)
 	}
 }
 
@@ -1049,7 +1075,7 @@ func scanGuarded(r *Rule, i int, e *Endpoint) (*epCache, error) {
 func scanEndpoint(r *Rule, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
 	c := newCache()
 	if r.FileMode {
-		fi, err := os.Lstat(filepath.Join(e.Dir, e.File))
+		fi, err := e.FS.Lstat(e.FS.Join(e.Dir, e.File))
 		if errors.Is(err, fs.ErrNotExist) {
 			return c, nil
 		}
@@ -1059,11 +1085,11 @@ func scanEndpoint(r *Rule, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
 		if !fi.Mode().IsRegular() {
 			return nil, fmt.Errorf("%s — не обычный файл", e.File)
 		}
-		c.files[fileKey] = FInfo{Rel: e.File, Size: fi.Size(), MTime: fi.ModTime().UnixNano()}
+		c.files[fileKey] = FInfo{Rel: e.File, Size: fi.Size(), MTime: fi.ModTime().UnixNano(), Attr: e.FS.AttrsOf(fi)}
 		return c, nil
 	}
 	root := e.Dir
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+	err := walkFS(e.FS, root, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			// Нечитаемая папка не должна выглядеть как «файлы удалены».
 			return werr
@@ -1082,12 +1108,12 @@ func scanEndpoint(r *Rule, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
 			if !r.Recursive || ignored(r, name) {
 				return fs.SkipDir
 			}
-			rel, _ := filepath.Rel(root, p)
-			c.dirs[relKey(rel)] = filepath.ToSlash(rel)
+			rel, _ := e.FS.RelSlash(root, p)
+			c.dirs[relKey(rel)] = rel
 			return nil
 		}
 		if d.Type().IsRegular() && tempNameRe.MatchString(name) {
-			removeStaleTemp(p, d)
+			removeStaleTemp(e.FS, p, d)
 			return nil
 		}
 		if ignored(r, name) || !d.Type().IsRegular() {
@@ -1103,8 +1129,7 @@ func scanEndpoint(r *Rule, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
 		if ierr != nil {
 			return ierr
 		}
-		rel, _ := filepath.Rel(root, p)
-		rel = filepath.ToSlash(rel)
+		rel, _ := e.FS.RelSlash(root, p)
 		key := strings.ToLower(rel)
 		if prev, dup := c.files[key]; dup {
 			if len(c.coll[key]) == 0 {
@@ -1112,7 +1137,7 @@ func scanEndpoint(r *Rule, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
 			}
 			c.coll[key] = append(c.coll[key], rel)
 		}
-		c.files[key] = FInfo{Rel: rel, Size: info.Size(), MTime: info.ModTime().UnixNano()}
+		c.files[key] = FInfo{Rel: rel, Size: info.Size(), MTime: info.ModTime().UnixNano(), Attr: e.FS.AttrsOf(info)}
 		return nil
 	})
 	return c, err
@@ -1120,7 +1145,7 @@ func scanEndpoint(r *Rule, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
 
 // statEntry проверяет один файл. ok=false — файла нет (или он не подходит под правило).
 func statEntry(r *Rule, e *Endpoint, rel string) (FInfo, bool, error) {
-	fi, err := os.Lstat(r.abs(e, rel))
+	fi, err := e.FS.Lstat(r.abs(e, rel))
 	if errors.Is(err, fs.ErrNotExist) {
 		return FInfo{}, false, nil
 	}
@@ -1135,7 +1160,7 @@ func statEntry(r *Rule, e *Endpoint, rel string) (FInfo, bool, error) {
 			return FInfo{}, false, nil
 		}
 	}
-	return FInfo{Rel: rel, Size: fi.Size(), MTime: fi.ModTime().UnixNano()}, true, nil
+	return FInfo{Rel: rel, Size: fi.Size(), MTime: fi.ModTime().UnixNano(), Attr: e.FS.AttrsOf(fi)}, true, nil
 }
 
 // refreshKeys обновляет кэш для перечисленных ключей во всех путях правила.
@@ -1260,9 +1285,9 @@ func walkNew(r *Rule, e *Endpoint, c *epCache, rel string, out map[string]string
 
 func (r *Rule) abs(e *Endpoint, rel string) string {
 	if r.FileMode {
-		return filepath.Join(e.Dir, e.File)
+		return e.FS.Join(e.Dir, e.File)
 	}
-	return filepath.Join(e.Dir, filepath.FromSlash(rel))
+	return e.FS.Join(e.Dir, e.FS.FromRel(rel))
 }
 
 func labelOf(e *Endpoint, i int) string {
@@ -1279,14 +1304,14 @@ func absI64(x int64) int64 {
 	return x
 }
 
-func hashFile(p string) (string, error) {
-	f, err := os.Open(p)
+func hashFile(f FileFS, p string) (string, error) {
+	in, err := f.Open(p)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer in.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, in); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -1407,8 +1432,8 @@ func (en *Engine) planTwoWay(r *Rule, st *State, scans []map[string]FInfo, joini
 			if unrel && hasBase && !(isMod[i] && isMod[k]) {
 				return false // не скачиваем файл из облака ради сравнения: проще скопировать заново
 			}
-			ha, e1 := hashFile(r.abs(r.Endpoints[i], a.Rel))
-			hb, e2 := hashFile(r.abs(r.Endpoints[k], c.Rel))
+			ha, e1 := hashFile(r.Endpoints[i].FS, r.abs(r.Endpoints[i], a.Rel))
+			hb, e2 := hashFile(r.Endpoints[k].FS, r.abs(r.Endpoints[k], c.Rel))
 			return e1 == nil && e2 == nil && ha == hb
 		}
 		// победитель: у кого время изменения надёжно и новее (у облака время ненадёжно — оно проигрывает)
@@ -1420,6 +1445,9 @@ func (en *Engine) planTwoWay(r *Rule, st *State, scans []map[string]FInfo, joini
 			}
 		}
 		j := &job{key: key, rel: cur[w].Rel, winner: w, wi: *cur[w]}
+		if hasBase {
+			j.attr = b.Attr
+		}
 		for i := 0; i < n; i++ {
 			if i == w {
 				continue
@@ -1497,11 +1525,10 @@ func (en *Engine) planOneWay(r *Rule, scans []map[string]FInfo, only map[string]
 
 // ---------- выполнение ----------
 
-func conflictName(dst, label string, mt time.Time) string {
-	dir, base := filepath.Split(dst)
-	ext := filepath.Ext(base)
-	stem := strings.TrimSuffix(base, ext)
-	return filepath.Join(dir, fmt.Sprintf("%s.sync-conflict-%s-%s%s", stem, mt.Format("20060102-150405"), label, ext))
+func conflictName(f FileFS, dst, label string, mt time.Time) string {
+	dir, base := f.Dir(dst), f.Base(dst)
+	stem, ext := splitName(base)
+	return f.Join(dir, fmt.Sprintf("%s.sync-conflict-%s-%s%s", stem, mt.Format("20060102-150405"), label, ext))
 }
 
 func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FInfo, j *job, ps *passStats) bool {
@@ -1526,10 +1553,10 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 			}
 			dst := r.abs(e, rel)
 			if c.rename && hadOld {
-				cn := conflictName(dst, labelOf(e, c.dst), time.Unix(0, old.MTime))
-				en.logf(r.Name, "WARN", "конфликт: %s сохранён как %s", dst, filepath.Base(cn))
+				cn := conflictName(e.FS, dst, labelOf(e, c.dst), time.Unix(0, old.MTime))
+				en.logf(r.Name, "WARN", "конфликт: %s сохранён как %s", dst, e.FS.Base(cn))
 				if !en.dry {
-					if err := r.op(c.dst, func() error { return os.Rename(dst, cn) }); err != nil {
+					if err := r.op(c.dst, func() error { return e.FS.Rename(dst, cn) }); err != nil {
 						en.logf(r.Name, "ERROR", "не удалось переименовать %s: %v", dst, err)
 						ps.failed++
 						ok = false
@@ -1540,7 +1567,7 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 				en.notify(r, "Конфликт файлов", filepath.Base(dst)+" — сохранена конфликтная копия")
 			}
 			en.logf(r.Name, "INFO", "копирую %s -> %s", src, dst)
-			if err := en.copyFile(r, j.winner, src, wi, c.dst, dst); err != nil {
+			if err := en.copyFile(r, j.winner, src, wi, c.dst, dst, j.attr); err != nil {
 				ok = false
 				if errors.Is(err, errSourceChanged) {
 					ps.pending++
@@ -1557,7 +1584,7 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 			if !en.dry {
 				mt := time.Unix(0, wi.MTime)
 				p := r.abs(r.Endpoints[i], scans[i][j.key].Rel)
-				_ = r.op(i, func() error { return os.Chtimes(p, mt, mt) })
+				_ = r.op(i, func() error { return r.Endpoints[i].FS.Chtimes(p, mt) })
 			}
 		}
 	}
@@ -1587,9 +1614,10 @@ func sameVolume(a, b string) bool {
 
 // createTemp создаёт временный файл для большого файла: рядом с целевым с приставкой
 // LocalSyncExt-ДАТА-ВРЕМЯ- (переименование атомарно) или в рабочей папке (temp=work, только на том же томе).
-func createTemp(r *Rule, dstPath string) (*os.File, string, error) {
-	dir, base := filepath.Split(dstPath)
-	if r.TempMode == "work" && sameVolume(r.workDir, dir) {
+func createTemp(r *Rule, di int, dstPath string) (WFile, string, error) {
+	f := r.Endpoints[di].FS
+	dir, base := f.Dir(dstPath), f.Base(dstPath)
+	if r.TempMode == "work" && f.Local() && sameVolume(r.workDir, dir) {
 		dir = filepath.Join(r.workDir, "tmp")
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, "", err
@@ -1601,10 +1629,10 @@ func createTemp(r *Rule, dstPath string) (*os.File, string, error) {
 		if n > 0 {
 			name = fmt.Sprintf("LocalSyncExt-%s-%d-%s", stamp, n, base)
 		}
-		p := filepath.Join(dir, name)
-		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		p := f.Join(dir, name)
+		w, err := f.Create(p, true)
 		if err == nil {
-			return f, p, nil
+			return w, p, nil
 		}
 		if !errors.Is(err, fs.ErrExist) {
 			return nil, "", err
@@ -1613,30 +1641,31 @@ func createTemp(r *Rule, dstPath string) (*os.File, string, error) {
 	return nil, "", errors.New("не удалось подобрать имя временного файла")
 }
 
-func (en *Engine) copyFile(r *Rule, si int, srcPath string, wi FInfo, di int, dstPath string) error {
+func (en *Engine) copyFile(r *Rule, si int, srcPath string, wi FInfo, di int, dstPath string, hint *Attrs) error {
 	if en.dry {
 		return nil
 	}
-	if err := r.op(di, func() error { return os.MkdirAll(filepath.Dir(dstPath), 0o755) }); err != nil {
+	sf, df := r.Endpoints[si].FS, r.Endpoints[di].FS
+	if err := r.op(di, func() error { return df.MkdirAll(df.Dir(dstPath)) }); err != nil {
 		return err
 	}
 	if r.DirectKB > 0 && wi.Size <= int64(r.DirectKB)*1024 {
-		return en.copyDirect(r, si, srcPath, wi, di, dstPath)
+		return en.copyDirect(r, si, srcPath, wi, di, dstPath, hint)
 	}
-	in, err := os.Open(srcPath)
+	in, err := sf.Open(srcPath)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	var out *os.File
+	var out WFile
 	var tmp string
-	if err := r.op(di, func() (cerr error) { out, tmp, cerr = createTemp(r, dstPath); return }); err != nil {
+	if err := r.op(di, func() (cerr error) { out, tmp, cerr = createTemp(r, di, dstPath); return }); err != nil {
 		return err
 	}
 	if stall := maxDur(r.stall(si), r.stall(di)); stall > 0 {
 		err = copyStall(out, in, stall)
 		if errors.Is(err, errStalled) {
-			go os.Remove(tmp) // может зависнуть вместе с диском — не ждём
+			go df.Remove(tmp) // может зависнуть вместе с диском — не ждём
 			return err
 		}
 	} else {
@@ -1649,34 +1678,67 @@ func (en *Engine) copyFile(r *Rule, si int, srcPath string, wi FInfo, di int, ds
 		err = cerr
 	}
 	if err != nil {
-		os.Remove(tmp)
+		df.Remove(tmp)
 		return err
 	}
-	fi, err := os.Stat(srcPath)
+	fi, err := sf.Stat(srcPath)
 	if err != nil || fi.Size() != wi.Size || fi.ModTime().UnixNano() != wi.MTime {
-		os.Remove(tmp)
+		df.Remove(tmp)
 		return errSourceChanged
 	}
 	mt := time.Unix(0, wi.MTime)
-	if err := r.op(di, func() error { return os.Chtimes(tmp, mt, mt) }); err != nil && r.mtimeReliable(di) {
-		os.Remove(tmp)
+	if err := r.op(di, func() error { return df.Chtimes(tmp, mt) }); err != nil && r.mtimeReliable(di) {
+		df.Remove(tmp)
 		return err
 	}
+	if want := wantAttrs(r, di, dstPath, wi, hint); want != nil {
+		en.applyAttrs(r, di, tmp, *want)
+	}
 	if err := r.op(di, func() error {
-		if _, lerr := os.Lstat(dstPath); lerr == nil {
+		if _, lerr := df.Lstat(dstPath); lerr == nil {
 			_, rerr := en.removeOld(r, di, dstPath)
 			return rerr
 		}
 		return nil
 	}); err != nil {
-		os.Remove(tmp)
+		df.Remove(tmp)
 		return err
 	}
-	if err := r.op(di, func() error { return os.Rename(tmp, dstPath) }); err != nil {
-		os.Remove(tmp)
+	if err := r.op(di, func() error { return df.Rename(tmp, dstPath) }); err != nil {
+		df.Remove(tmp)
 		return err
 	}
 	return nil
+}
+
+// wantAttrs — какие права и владельца поставить новому файлу: как у заменяемого файла,
+// иначе как у источника (Linux → Linux), иначе как запомнено в базе (после обхода через Windows).
+func wantAttrs(r *Rule, di int, dstPath string, wi FInfo, hint *Attrs) *Attrs {
+	df := r.Endpoints[di].FS
+	if !df.HasAttrs() {
+		return nil
+	}
+	var old *Attrs
+	_ = r.op(di, func() error {
+		if info, err := df.Lstat(dstPath); err == nil {
+			old = df.AttrsOf(info)
+		}
+		return nil
+	})
+	switch {
+	case old != nil:
+		return old
+	case wi.Attr != nil:
+		return wi.Attr
+	}
+	return hint
+}
+
+func (en *Engine) applyAttrs(r *Rule, di int, p string, a Attrs) {
+	df := r.Endpoints[di].FS
+	if err := r.op(di, func() error { return df.SetAttrs(p, a) }); err != nil && r.attrWarned.CompareAndSwap(false, true) {
+		en.logf(r.Name, "WARN", "права или владелец не применены к файлу на пути №%d: %v (для смены владельца нужен вход под root)", di+1, err)
+	}
 }
 
 func maxDur(a, b time.Duration) time.Duration {
@@ -1703,7 +1765,7 @@ func guardOp(d time.Duration, fn func() error) error {
 
 // copyStall копирует данные кусками и прерывается, если движения нет дольше stall
 // (оборвалась сеть, завис rclone/sshfs).
-func copyStall(dst, src *os.File, stall time.Duration) error {
+func copyStall(dst io.WriteCloser, src io.ReadCloser, stall time.Duration) error {
 	var prog atomic.Int64
 	done := make(chan error, 1)
 	go func() {
@@ -1747,27 +1809,29 @@ func copyStall(dst, src *os.File, stall time.Duration) error {
 }
 
 // copyDirect — малые файлы: читаем в память и пишем сразу в целевой файл, без временного.
-func (en *Engine) copyDirect(r *Rule, si int, srcPath string, wi FInfo, di int, dstPath string) error {
+func (en *Engine) copyDirect(r *Rule, si int, srcPath string, wi FInfo, di int, dstPath string, hint *Attrs) error {
+	sf, df := r.Endpoints[si].FS, r.Endpoints[di].FS
 	var data []byte
-	err := r.op(si, func() (rerr error) { data, rerr = os.ReadFile(srcPath); return })
+	err := r.op(si, func() (rerr error) { data, rerr = sf.ReadFile(srcPath); return })
 	if err != nil {
 		return err
 	}
-	fi, err := os.Stat(srcPath)
+	fi, err := sf.Stat(srcPath)
 	if err != nil || fi.Size() != wi.Size || fi.ModTime().UnixNano() != wi.MTime || int64(len(data)) != wi.Size {
 		return errSourceChanged
 	}
 	mt := time.Unix(0, wi.MTime)
 	setTime := func() error {
-		if err := r.op(di, func() error { return os.Chtimes(dstPath, mt, mt) }); err != nil && r.mtimeReliable(di) {
+		if err := r.op(di, func() error { return df.Chtimes(dstPath, mt) }); err != nil && r.mtimeReliable(di) {
 			return err
 		}
 		return nil
 	}
+	want := wantAttrs(r, di, dstPath, wi, hint)
 	trashed := ""
-	if _, lerr := os.Lstat(dstPath); lerr == nil {
+	if _, lerr := df.Lstat(dstPath); lerr == nil {
 		if r.TrashDays < 0 {
-			if err := r.op(di, func() error { return os.WriteFile(dstPath, data, 0o644) }); err != nil {
+			if err := r.op(di, func() error { return df.WriteFile(dstPath, data) }); err != nil {
 				return err
 			}
 			return setTime()
@@ -1776,85 +1840,53 @@ func (en *Engine) copyDirect(r *Rule, si int, srcPath string, wi FInfo, di int, 
 			return err
 		}
 	}
-	if err := r.op(di, func() error { return os.WriteFile(dstPath, data, 0o644) }); err != nil {
-		_ = os.Remove(dstPath)
+	if err := r.op(di, func() error { return df.WriteFile(dstPath, data) }); err != nil {
+		_ = df.Remove(dstPath)
 		if trashed != "" {
-			_ = os.Rename(trashed, dstPath) // вернуть прежнюю версию
+			_ = df.Rename(trashed, dstPath) // вернуть прежнюю версию
 		}
 		return err
+	}
+	if want != nil {
+		en.applyAttrs(r, di, dstPath, *want)
 	}
 	return setTime()
 }
 
 // moveFile переносит файл; если Rename невозможен (другой том) — копирует и удаляет исходный.
-func moveFile(src, dst string) error {
-	rerr := os.Rename(src, dst)
-	if rerr == nil {
-		return nil
-	}
-	fi, err := os.Stat(src)
-	if err != nil {
-		return rerr
-	}
-	return copyThenRemove(src, dst, fi)
-}
-
-func copyThenRemove(src, dst string, fi fs.FileInfo) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(out, in)
-	if err == nil {
-		err = out.Sync()
-	}
-	if cerr := out.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = os.Chtimes(dst, fi.ModTime(), fi.ModTime())
-	}
-	if err != nil {
-		os.Remove(dst)
-		return err
-	}
-	in.Close()
-	return os.Remove(src)
-}
 
 // removeOld: в корзину (путь возвращается) или удалить, в зависимости от TrashDays правила.
 func (en *Engine) removeOld(r *Rule, i int, p string) (string, error) {
+	sf := r.Endpoints[i].FS
 	if r.TrashDays < 0 {
-		return "", os.Remove(p)
+		return "", sf.Remove(p)
 	}
 	e := r.Endpoints[i]
-	rel := filepath.Base(p)
+	tf, root := r.trashRoot(i)
+	rel := sf.Base(p)
 	if !r.FileMode {
-		if x, err := filepath.Rel(e.Dir, p); err == nil {
+		if x, err := sf.RelSlash(e.Dir, p); err == nil {
 			rel = x
 		}
 	}
-	root := r.trashRoot(i)
-	dir, base := filepath.Split(rel)
-	ext := filepath.Ext(base)
-	stem := strings.TrimSuffix(base, ext)
+	relN := tf.FromRel(rel)
+	dir, base := tf.Dir(relN), tf.Base(relN)
+	if dir == "." {
+		dir = ""
+	}
+	stem, ext := splitName(base)
 	stamp := time.Now().Format("20060102-150405")
-	dst := filepath.Join(root, dir, fmt.Sprintf("%s~%s%s", stem, stamp, ext))
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	dst := tf.Join(root, dir, fmt.Sprintf("%s~%s%s", stem, stamp, ext))
+	if err := tf.MkdirAll(tf.Dir(dst)); err != nil {
 		return "", err
 	}
 	for n := 1; ; n++ {
-		if _, err := os.Lstat(dst); errors.Is(err, fs.ErrNotExist) {
+		if _, err := tf.Lstat(dst); errors.Is(err, fs.ErrNotExist) {
 			break
 		}
-		dst = filepath.Join(root, dir, fmt.Sprintf("%s~%s-%d%s", stem, stamp, n, ext))
+		dst = tf.Join(root, dir, fmt.Sprintf("%s~%s-%d%s", stem, stamp, n, ext))
 	}
-	return dst, moveFile(p, dst)
+	return dst, moveBetween(sf, p, tf, dst)
 }
 
 var trashStampRe = regexp.MustCompile(`~(\d{8}-\d{6})`)
@@ -1863,13 +1895,16 @@ func (en *Engine) cleanTrash(r *Rule) {
 	cutoff := time.Now().Add(-time.Duration(r.TrashDays) * 24 * time.Hour)
 	seen := map[string]bool{}
 	for i := range r.Endpoints {
-		root := r.trashRoot(i)
+		tf, root := r.trashRoot(i)
 		if seen[strings.ToLower(root)] {
 			continue
 		}
 		seen[strings.ToLower(root)] = true
+		if r.kind(i) != "local" && tf != theLocalFS {
+			// корзина на удалённом диске: чистим тем же способом, но с ограничением ожидания
+		}
 		var dirs []string
-		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		_ = walkFS(tf, root, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil
 			}
@@ -1879,7 +1914,7 @@ func (en *Engine) cleanTrash(r *Rule) {
 			}
 			if m := trashStampRe.FindAllStringSubmatch(d.Name(), -1); len(m) > 0 {
 				if t, perr := time.ParseInLocation("20060102-150405", m[len(m)-1][1], time.Local); perr == nil && t.Before(cutoff) {
-					if os.Remove(p) == nil {
+					if tf.Remove(p) == nil {
 						en.logf(r.Name, "INFO", "корзина: удалён устаревший %s", p)
 					}
 				}
@@ -1887,7 +1922,7 @@ func (en *Engine) cleanTrash(r *Rule) {
 			return nil
 		})
 		for k := len(dirs) - 1; k > 0; k-- {
-			_ = os.Remove(dirs[k]) // удалится, только если пуста
+			_ = tf.Remove(dirs[k]) // удалится, только если пуста
 		}
 	}
 }
@@ -1899,7 +1934,7 @@ func cleanWorkTmp(r *Rule) {
 	}
 	_ = filepath.WalkDir(filepath.Join(r.workDir, "tmp"), func(p string, d fs.DirEntry, err error) error {
 		if err == nil && d.Type().IsRegular() {
-			removeStaleTemp(p, d)
+			removeStaleTemp(theLocalFS, p, d)
 		}
 		return nil
 	})
@@ -1929,4 +1964,20 @@ func (en *Engine) skipCaseCollisions(r *Rule, rt *ruleRT, jobs []*job) []*job {
 		}
 	}
 	return out
+}
+
+// attachFS подставляет каждому пути правила его файловую систему (локальный диск или SFTP).
+func (en *Engine) attachFS(r *Rule) error {
+	for _, e := range r.Endpoints {
+		if e.Conn == "" {
+			e.FS = theLocalFS
+			continue
+		}
+		f, err := en.cm.Get(e.Conn)
+		if err != nil {
+			return err
+		}
+		e.FS = f
+	}
+	return nil
 }

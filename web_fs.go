@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -52,6 +53,49 @@ func fsList(p string) (*fsResp, error) {
 		resp.Parent = par
 	} else {
 		resp.Parent = "" // корень диска -> список дисков
+	}
+	for i, e := range ents {
+		if i >= fsMaxEntries {
+			resp.Truncated = true
+			break
+		}
+		fe := fsEntry{Name: e.Name(), Dir: e.IsDir()}
+		if info, err := e.Info(); err == nil {
+			fe.MTime = info.ModTime().Unix()
+			if !fe.Dir {
+				fe.Size = info.Size()
+			}
+		}
+		resp.Entries = append(resp.Entries, fe)
+	}
+	sort.SliceStable(resp.Entries, func(i, j int) bool {
+		a, b := resp.Entries[i], resp.Entries[j]
+		if a.Dir != b.Dir {
+			return a.Dir
+		}
+		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+	})
+	return resp, nil
+}
+
+// fsListFS — то же для удалённой файловой системы (SFTP); пустой путь — корень сервера.
+func fsListFS(f FileFS, p string) (*fsResp, error) {
+	resp := &fsResp{Sep: "/"}
+	p = strings.TrimSpace(p)
+	if p == "" {
+		p = "/"
+	}
+	p = path.Clean(p)
+	if !strings.HasPrefix(p, "/") {
+		return nil, fmt.Errorf("нужен полный путь, начинающийся с /")
+	}
+	ents, err := f.ReadDir(p)
+	if err != nil {
+		return nil, err
+	}
+	resp.Path = p
+	if p != "/" {
+		resp.Parent = path.Dir(p)
 	}
 	for i, e := range ents {
 		if i >= fsMaxEntries {

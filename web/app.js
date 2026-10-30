@@ -154,7 +154,8 @@ async function pageRules() {
 }
 
 // ---------- обзор файлов ----------
-function fileBrowser({ title, start, onDone }) {
+function fileBrowser({ title, start, conns, onDone }) {
+  let where = ''; // '' — этот компьютер, иначе имя SFTP-подключения
   let cur = { path: '', sep: '\\' };
   const checked = new Set();
   const pathInput = h('input', { type: 'text', placeholder: 'Путь, например C:\\ или D:\\Docs' });
@@ -162,39 +163,43 @@ function fileBrowser({ title, start, onDone }) {
   const err = h('div');
   const maskInput = h('input', { type: 'text', placeholder: 'маска, например *.pdf', style: 'width:180px' });
   const countBtn = h('button', { class: 'primary' }, 'Выбрать отмеченное');
+  const whereSel = h('select', { onchange: (e) => { where = e.target.value; load(where ? '/' : ''); } },
+    h('option', { value: '' }, 'Этот компьютер'), ...(conns || []).map((c) => h('option', { value: c.name }, 'SFTP: ' + c.name)));
+  const full = (p) => (where ? 'sftp://' + where + p : p);
   const join = (n) => (cur.path === '' ? n : cur.path.endsWith(cur.sep) ? cur.path + n : cur.path + cur.sep + n);
   function updateCount() { countBtn.textContent = 'Выбрать отмеченное (' + checked.size + ')'; countBtn.disabled = checked.size === 0; }
   async function load(p) {
     clear(err);
     try {
-      const d = await api('/api/fs?path=' + encodeURIComponent(p));
-      cur = d; if (!cur.sep) cur.sep = '\\';
+      const d = await api('/api/fs?path=' + encodeURIComponent(p) + (where ? '&conn=' + encodeURIComponent(where) : ''));
+      cur = d; if (!cur.sep) cur.sep = where ? '/' : '\\';
       pathInput.value = d.path;
       checked.clear(); updateCount();
       clear(body);
-      if (d.path !== '') body.append(h('div', { class: 'frow' }, h('span', { class: 'fname', onclick: () => load(d.parent || '') }, '⬆ ..')));
+      if (d.path !== '' && (d.parent || !where)) body.append(h('div', { class: 'frow' }, h('span', { class: 'fname', onclick: () => load(d.parent || '') }, '⬆ ..')));
       if (d.truncated) body.append(h('div', { class: 'warnbox' }, 'Показаны не все элементы (слишком много). Впишите путь вручную.'));
       for (const e of d.entries) {
-        const full = d.path === '' ? e.name : join(e.name);
-        const cb = h('input', { type: 'checkbox', onchange: (ev) => { if (ev.target.checked) checked.add(full); else checked.delete(full); updateCount(); } });
+        const fullp = d.path === '' ? e.name : join(e.name);
+        const cb = h('input', { type: 'checkbox', onchange: (ev) => { if (ev.target.checked) checked.add(fullp); else checked.delete(fullp); updateCount(); } });
         body.append(h('div', { class: 'frow' }, d.path === '' ? null : cb,
-          h('span', { class: 'fname', onclick: () => { if (e.dir) load(full); else { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); } } }, (e.dir ? '📁 ' : '📄 ') + e.name),
+          h('span', { class: 'fname', onclick: () => { if (e.dir) load(fullp); else { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); } } }, (e.dir ? '📁 ' : '📄 ') + e.name),
           e.dir ? null : h('span', { class: 'fsize' }, fmtSize(e.size))));
       }
     } catch (e) { err.append(h('div', { class: 'errbox' }, e.message)); }
   }
   const bg = h('div', { class: 'modal-bg' });
   const close = () => bg.remove();
-  countBtn.addEventListener('click', () => { const v = [...checked]; close(); onDone(v); });
+  countBtn.addEventListener('click', () => { const v = [...checked].map(full); close(); onDone(v); });
   pathInput.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') load(pathInput.value); });
   const modal = h('div', { class: 'modal' },
     h('div', { class: 'mh' }, h('b', {}, title || 'Выбор файлов и папок'),
-      h('div', { class: 'row' }, pathInput, h('button', { onclick: () => load(pathInput.value) }, 'Перейти'), h('button', { onclick: () => load('') }, 'Диски')),
+      (conns && conns.length) ? h('div', { class: 'row' }, h('span', { class: 'muted' }, 'Где:'), whereSel) : null,
+      h('div', { class: 'row' }, pathInput, h('button', { onclick: () => load(pathInput.value) }, 'Перейти'), h('button', { onclick: () => load(where ? '/' : '') }, where ? 'Корень' : 'Диски')),
       err),
     body,
     h('div', { class: 'mf' }, countBtn,
-      h('button', { onclick: () => { if (cur.path) { const p = cur.path; close(); onDone([p]); } } }, 'Выбрать эту папку'),
-      h('span', { class: 'row' }, maskInput, h('button', { onclick: () => { const m = maskInput.value.trim(); if (m && cur.path) { const p = join(m); close(); onDone([p]); } } }, 'Папка + маска')),
+      h('button', { onclick: () => { if (cur.path) { const p = full(cur.path); close(); onDone([p]); } } }, 'Выбрать эту папку'),
+      h('span', { class: 'row' }, maskInput, h('button', { onclick: () => { const m = maskInput.value.trim(); if (m && cur.path) { const p = full(join(m)); close(); onDone([p]); } } }, 'Папка + маска')),
       h('span', { class: 'grow', style: 'flex:1' }), h('button', { onclick: close }, 'Отмена')));
   bg.append(modal);
   bg.addEventListener('mousedown', (ev) => { if (ev.target === bg) close(); });
@@ -203,17 +208,25 @@ function fileBrowser({ title, start, onDone }) {
   // начинаем с папки введённого пути (если это файл — его родитель)
   (async () => {
     let p = start || '';
-    if (p) {
-      try { await api('/api/fs?path=' + encodeURIComponent(p)); } catch (e) {
-        const i = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
-        p = i > 2 ? p.slice(0, i) : (i >= 0 ? p.slice(0, i + 1) : '');
-      }
+    const m = /^sftp:\/\/([^/]+)(\/.*)?$/i.exec(p);
+    if (m && (conns || []).some((c) => c.name.toLowerCase() === m[1].toLowerCase())) {
+      where = conns.find((c) => c.name.toLowerCase() === m[1].toLowerCase()).name;
+      whereSel.value = where;
+      p = m[2] || '/';
     }
+    if (p) {
+      try { await api('/api/fs?path=' + encodeURIComponent(p) + (where ? '&conn=' + encodeURIComponent(where) : '')); } catch (e) {
+        const i = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
+        p = i > 2 ? p.slice(0, i) : (i >= 0 ? p.slice(0, i + 1) : (where ? '/' : ''));
+      }
+    } else if (where) p = '/';
     load(p);
   })();
 }
 
 // ---------- редактор правила ----------
+const isSFTP = (p) => /^sftp:\/\//i.test((p || '').trim());
+
 const OPT_SPECS = [
   { k: 'enabled', label: 'Правило включено', t: 'bool', def: 'Да' },
   { k: 'mode', label: 'Режим', t: 'sel', opts: [['twoway', 'Двусторонний (изменения идут во все стороны)'], ['oneway', 'Односторонний (остальные пути — копия главного)']], def: 'двусторонний' },
@@ -306,14 +319,18 @@ async function pageRule(name) {
   function renderPaths() {
     clear(pathsBox);
     R.paths.forEach((pr, i) => {
-      const inp = h('input', { type: 'text', value: pr.p, placeholder: 'C:\\папка, C:\\файл.txt или C:\\папка\\*.pdf', oninput: (e) => { pr.p = e.target.value; } });
+      const inp = h('input', { type: 'text', value: pr.p, placeholder: 'C:\\папка, C:\\файл.txt, C:\\папка\\*.pdf или sftp://подключение/путь', oninput: (e) => { pr.p = e.target.value; sync(); } });
+      const badgeEl = h('span', { class: 'badge idle', title: 'Прямое SSH/SFTP-подключение: слежение по таймеру, контроль зависания' }, 'SFTP');
+      const kindEl = h('select', { title: 'Тип диска: от него зависят слежение, таймауты и сравнение времени изменения', onchange: (e) => { pr.kind = e.target.value; } },
+        h('option', { value: 'local', selected: pr.kind === 'local' }, 'Локальный'),
+        h('option', { value: 'remote', selected: pr.kind === 'remote' }, 'Сетевой (sshfs, SMB)'),
+        h('option', { value: 'cloud', selected: pr.kind === 'cloud' }, 'Облако (rclone)'));
+      const sync = () => { badgeEl.style.display = isSFTP(pr.p) ? '' : 'none'; kindEl.style.display = isSFTP(pr.p) ? 'none' : ''; };
+      sync();
       pathsBox.append(h('div', { class: 'pathrow' },
         h('span', { class: 'num' }, '№' + (i + 1)), inp,
-        h('select', { title: 'Тип диска: от него зависят слежение, таймауты и сравнение времени изменения', onchange: (e) => { pr.kind = e.target.value; } },
-          h('option', { value: 'local', selected: pr.kind === 'local' }, 'Локальный'),
-          h('option', { value: 'remote', selected: pr.kind === 'remote' }, 'Сетевой (sshfs, SMB)'),
-          h('option', { value: 'cloud', selected: pr.kind === 'cloud' }, 'Облако (rclone)')),
-        h('button', { class: 'small', onclick: () => fileBrowser({ title: 'Путь №' + (i + 1), start: pr.p, onDone: (v) => {
+        badgeEl, kindEl,
+        h('button', { class: 'small', onclick: () => fileBrowser({ title: 'Путь №' + (i + 1), start: pr.p, conns: cfg.connections, onDone: (v) => {
           if (!v.length) return;
           pr.p = v[0];
           R.paths.splice(i + 1, 0, ...v.slice(1).map((p) => ({ p, nm: false, kind: pr.kind })));
@@ -345,7 +362,7 @@ async function pageRule(name) {
     const nonEmpty = R.paths.filter((pr) => pr.p.trim());
     const nm2 = nonEmpty.map((pr, i) => (pr.nm ? i + 1 : 0)).filter(Boolean);
     if (nm2.length) opts.push({ k: 'nomarker', v: nm2.join(',') });
-    const idx = (kind) => nonEmpty.map((pr, i) => (pr.kind === kind ? i + 1 : 0)).filter(Boolean).join(',');
+    const idx = (kind) => nonEmpty.map((pr, i) => (pr.kind === kind && !isSFTP(pr.p) ? i + 1 : 0)).filter(Boolean).join(',');
     if (idx('remote')) opts.push({ k: 'remote', v: idx('remote') });
     if (idx('cloud')) opts.push({ k: 'cloud', v: idx('cloud') });
     return { name: R.name.trim(), desc: R.desc.trim(), opts, paths: nonEmpty.map((pr) => pr.p.trim()) };
@@ -362,7 +379,7 @@ async function pageRule(name) {
       const clash = latest.rules.findIndex((r, i) => r.name.toLowerCase() === rule.name.toLowerCase() && i !== idx);
       if (clash >= 0) throw new Error('Правило с таким названием уже есть');
       if (idx >= 0) latest.rules[idx] = rule; else latest.rules.push(rule);
-      const res = await api('/api/config', { method: 'POST', body: { rev: latest.rev, settings: latest.settings, rules: latest.rules } });
+      const res = await api('/api/config', { method: 'POST', body: { rev: latest.rev, settings: latest.settings, connections: latest.connections, rules: latest.rules } });
       if (!isNew && rule.name !== name) alert('Правило переименовано. Для программы это новое правило: прежняя история синхронизации не переносится, лишнего удалено не будет.');
       if (res.warnings && res.warnings.length) alert('Сохранено. Замечания:\n' + res.warnings.join('\n'));
       location.hash = '#/';
@@ -373,7 +390,7 @@ async function pageRule(name) {
     try {
       const latest = await api('/api/config');
       latest.rules = latest.rules.filter((r) => r.name !== name);
-      await api('/api/config', { method: 'POST', body: { rev: latest.rev, settings: latest.settings, rules: latest.rules } });
+      await api('/api/config', { method: 'POST', body: { rev: latest.rev, settings: latest.settings, connections: latest.connections, rules: latest.rules } });
       location.hash = '#/';
     } catch (e) { errBox.replaceChildren(h('div', { class: 'errbox' }, errText(e))); }
   }
@@ -390,7 +407,7 @@ async function pageRule(name) {
       pathsBox,
       h('div', { class: 'row', style: 'margin-top:8px' },
         h('button', { onclick: () => { R.paths.push({ p: '', nm: false, kind: 'local' }); renderPaths(); renderOpts(); } }, '＋ Путь'),
-        h('button', { onclick: () => fileBrowser({ title: 'Добавить файлы и папки', start: '', onDone: (v) => {
+        h('button', { onclick: () => fileBrowser({ title: 'Добавить файлы и папки', start: '', conns: cfg.connections, onDone: (v) => {
           for (const p of v) { const empty = R.paths.find((x) => !x.p.trim()); if (empty) empty.p = p; else R.paths.push({ p, nm: false, kind: 'local' }); }
           renderPaths(); renderOpts();
         } }) }, '＋ Обзор (можно несколько)…'))),
@@ -466,6 +483,132 @@ async function pageStatus() {
   setTimer(() => { if (auto.checked) refresh(); }, 3000);
 }
 
+// ---------- подключения SSH/SFTP ----------
+function modal(title, body, buttons) {
+  const bg = h('div', { class: 'modal-bg' });
+  const close = () => bg.remove();
+  bg.append(h('div', { class: 'modal' }, h('div', { class: 'mh' }, h('b', {}, title)),
+    h('div', { class: 'mb', style: 'padding:12px 14px' }, ...body),
+    h('div', { class: 'mf' }, ...buttons(close))));
+  bg.addEventListener('mousedown', (ev) => { if (ev.target === bg) close(); });
+  document.body.append(bg);
+  return close;
+}
+
+function connPanel(cfg) {
+  const box = h('div', { class: 'panel' });
+  const msg = h('div');
+  const showErr = (e) => msg.replaceChildren(h('div', { class: 'errbox' }, errText(e)));
+  const showOk = (t) => msg.replaceChildren(h('div', { class: 'okbox' }, t));
+
+  async function saveConns(mutate) {
+    const latest = await api('/api/config');
+    mutate(latest);
+    await api('/api/config', { method: 'POST', body: { rev: latest.rev, settings: latest.settings, connections: latest.connections, rules: latest.rules } });
+    const fresh = await api('/api/config');
+    cfg.connections = fresh.connections; cfg.rev = fresh.rev;
+    render();
+  }
+
+  function edit(c) {
+    const isNew = !c;
+    const M = c ? { ...c } : { name: '', desc: '', host: '', port: 22, user: '', auth: 'key', keyfile: '', hostkey: '' };
+    const fld = (label, ctrl, hint) => h('div', { class: 'field' }, h('label', {}, label), ctrl, hint ? h('div', { class: 'hint' }, hint) : null);
+    const name = h('input', { type: 'text', value: M.name, disabled: !isNew, placeholder: 'например nas' });
+    const desc = h('input', { type: 'text', value: M.desc, placeholder: 'Домашний сервер' });
+    const host = h('input', { type: 'text', value: M.host, placeholder: '192.168.100.13' });
+    const port = h('input', { type: 'number', value: String(M.port || 22), style: 'width:110px' });
+    const user = h('input', { type: 'text', value: M.user, placeholder: 'root' });
+    const keyfile = h('input', { type: 'text', value: M.keyfile, placeholder: 'C:\\Users\\я\\.ssh\\id_ed25519' });
+    const secret = h('input', { type: 'password', autocomplete: 'new-password' });
+    const auth = h('select', { onchange: () => upd() }, h('option', { value: 'key', selected: M.auth === 'key' }, 'По ключу'), h('option', { value: 'password', selected: M.auth === 'password' }, 'По паролю'));
+    const keyRow = fld('Файл ключа', h('div', { class: 'row' }, keyfile, h('button', { class: 'small', onclick: () => fileBrowser({ title: 'Файл закрытого ключа', start: keyfile.value, onDone: (v) => { if (v.length) keyfile.value = v[0]; } }) }, 'Обзор…')));
+    const secLabel = h('label', {});
+    const secHint = h('div', { class: 'hint' });
+    const secRow = h('div', { class: 'field' }, secLabel, secret, secHint);
+    function upd() {
+      keyRow.style.display = auth.value === 'key' ? '' : 'none';
+      secLabel.textContent = auth.value === 'key' ? 'Парольная фраза ключа' : 'Пароль';
+      const has = auth.value === 'key' ? M.hasPassphrase : M.hasPassword;
+      secret.placeholder = has ? '(сохранён; впишите, чтобы заменить)' : (auth.value === 'key' ? 'если ключ без фразы — оставьте пустым' : 'пароль');
+      secHint.textContent = 'Хранится в зашифрованном виде (в Windows — средствами системы для вашей учётной записи) и никогда не показывается.';
+    }
+    upd();
+    const err = h('div');
+    modal(isNew ? 'Новое подключение' : 'Подключение: ' + M.name, [
+      fld('Имя', name, 'Используется в путях: sftp://имя/папка'), fld('Описание', desc), fld('Сервер', host), fld('Порт', port), fld('Пользователь', user),
+      fld('Вход', auth), keyRow, secRow, err,
+      isNew || M.hostkey ? null : h('div', { class: 'warnbox' }, 'После сохранения подтвердите отпечаток сервера.'),
+    ], (close) => [
+      h('button', { class: 'primary', onclick: async () => {
+        clear(err);
+        try {
+          const obj = { name: name.value.trim(), desc: desc.value.trim(), host: host.value.trim(), port: Number(port.value) || 22, user: user.value.trim(),
+            auth: auth.value, keyfile: auth.value === 'key' ? keyfile.value.trim() : '', hostkey: M.hostkey };
+          if (!isNew && (obj.host !== c.host || obj.port !== (c.port || 22))) obj.hostkey = ''; // другой сервер — отпечаток подтверждается заново
+          await saveConns((l) => {
+            const i = l.connections.findIndex((x) => x.name === obj.name);
+            if (i >= 0) l.connections[i] = obj; else l.connections.push(obj);
+          });
+          if (secret.value) await api('/api/secret', { method: 'POST', body: { conn: obj.name, kind: auth.value === 'key' ? 'passphrase' : 'password', value: secret.value } });
+          close();
+          const fresh = await api('/api/config'); cfg.connections = fresh.connections; render();
+          showOk('Подключение сохранено.' + (obj.hostkey ? '' : ' Нажмите «Отпечаток…», чтобы подтвердить сервер.'));
+        } catch (e) { err.replaceChildren(h('div', { class: 'errbox' }, errText(e))); }
+      } }, 'Сохранить'),
+      h('button', { onclick: close }, 'Отмена'),
+    ]);
+  }
+
+  async function trust(c) {
+    let r;
+    try { r = await api('/api/conn/probe', { method: 'POST', body: { name: c.name } }); } catch (e) { showErr(e); return; }
+    modal('Отпечаток сервера «' + c.name + '»', [
+      h('p', { style: 'margin:0 0 8px' }, 'Сервер ответил отпечатком ключа:'),
+      h('pre', { class: 'log', style: 'max-height:none' }, r.fingerprint),
+      r.trusted ? h('div', { class: 'okbox' }, 'Совпадает с подтверждённым отпечатком, ничего менять не нужно.')
+        : h('div', { class: 'warnbox' }, (r.current ? 'Подтверждён другой отпечаток: ' + r.current + '. Если вы не меняли ключи сервера, это может быть подмена — не подтверждайте. ' : '') +
+          'Сверьте отпечаток с серверным (на сервере: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) и подтвердите. Логин и пароль на сервер отправляются только после подтверждения.'),
+    ], (close) => [
+      r.trusted ? null : h('button', { class: 'primary', onclick: async () => {
+        try { await saveConns((l) => { l.connections.find((x) => x.name === c.name).hostkey = r.fingerprint; }); close(); showOk('Отпечаток подтверждён.'); } catch (e) { showErr(e); close(); }
+      } }, 'Доверять этому отпечатку'),
+      h('button', { onclick: close }, 'Закрыть'),
+    ]);
+  }
+
+  async function test(c) {
+    msg.replaceChildren(h('div', { class: 'muted' }, 'Проверяю подключение…'));
+    try { const r = await api('/api/conn/test', { method: 'POST', body: { name: c.name } }); showOk('Подключение «' + c.name + '» работает (элементов в корне: ' + r.entries + ').'); }
+    catch (e) { showErr(e); }
+  }
+
+  async function remove(c) {
+    if (!confirm('Удалить подключение «' + c.name + '»? Сохранённые для него пароль и парольная фраза тоже будут удалены.')) return;
+    try { await saveConns((l) => { l.connections = l.connections.filter((x) => x.name !== c.name); }); showOk('Подключение удалено.'); } catch (e) { showErr(e); }
+  }
+
+  function render() {
+    clear(box);
+    box.append(h('h3', { style: 'margin-top:0' }, 'Подключения SSH/SFTP'),
+      h('div', { class: 'muted', style: 'font-size:13px;margin-bottom:8px' }, 'Папки и файлы на Linux-серверах без подключения диска. В правилах путь записывается как sftp://имя/путь. К серверу можно подключиться только после подтверждения его отпечатка.'),
+      msg);
+    if (!cfg.connections.length) box.append(h('div', { class: 'muted' }, 'Подключений пока нет.'));
+    for (const c of cfg.connections) {
+      box.append(h('div', { class: 'pathrow' },
+        h('b', {}, c.name), h('span', { class: 'muted' }, c.user + '@' + c.host + ':' + (c.port || 22) + ' · ' + (c.auth === 'key' ? 'ключ' : 'пароль')),
+        c.hostkey ? h('span', { class: 'badge ok' }, 'сервер подтверждён') : h('span', { class: 'badge error' }, 'отпечаток не подтверждён'),
+        c.err ? h('span', { class: 'badge error' }, c.err) : null,
+        h('span', { style: 'flex:1' }),
+        h('button', { class: 'small', onclick: () => trust(c) }, 'Отпечаток…'), h('button', { class: 'small', onclick: () => test(c) }, 'Проверить'),
+        h('button', { class: 'small', onclick: () => edit(c) }, 'Изменить'), h('button', { class: 'small danger', onclick: () => remove(c) }, 'Удалить')));
+    }
+    box.append(h('div', { class: 'toolbar', style: 'margin-top:8px' }, h('button', { onclick: () => edit(null) }, '＋ Подключение')));
+  }
+  render();
+  return box;
+}
+
 // ---------- настройки ----------
 const ACTIONS = [['status', 'Показать сводку'], ['syncnow', 'Синхронизировать всё'], ['pause', 'Пауза / продолжить'], ['ui', 'Открыть веб-интерфейс'], ['log', 'Открыть журнал'], ['config', 'Открыть ini'], ['notify', 'Уведомления вкл/выкл'], ['none', 'Ничего']];
 const SETTING_GROUPS = [
@@ -513,7 +656,7 @@ async function pageSettings() {
       const settings = latest.settings.filter((kv) => !known.has(kv.k) || (kv.k in vals));
       for (const kv of settings) if (known.has(kv.k)) kv.v = vals[kv.k];
       for (const k of Object.keys(vals)) if (!settings.find((kv) => kv.k === k)) settings.push({ k, v: vals[k] });
-      const res = await api('/api/config', { method: 'POST', body: { rev: latest.rev, settings, rules: latest.rules } });
+      const res = await api('/api/config', { method: 'POST', body: { rev: latest.rev, settings, connections: latest.connections, rules: latest.rules } });
       errBox.append(h('div', { class: 'okbox' }, 'Сохранено и применено.' + (res.warnings && res.warnings.length ? ' Замечания: ' + res.warnings.join('; ') : '')));
     } catch (e) { errBox.append(h('div', { class: 'errbox' }, errText(e))); }
   }
@@ -529,7 +672,7 @@ async function pageSettings() {
   }
   shell('settings', h('h2', {}, 'Настройки'),
     h('div', { class: 'warnbox' }, 'Изменение настроек веб-интерфейса (порты, адреса) может сделать эту страницу недоступной по текущему адресу.'),
-    ...groups, errBox,
+    ...groups, connPanel(cfg), errBox,
     h('div', { class: 'toolbar' }, h('button', { class: 'primary', onclick: save }, 'Сохранить настройки')),
     h('div', { class: 'panel' }, h('h3', { style: 'margin-top:0' }, 'Логин и пароль для порта с авторизацией'),
       h('div', { class: 'muted', style: 'font-size:13px' }, 'Хранятся в виде хэша в папке состояния, не в ini.'),
@@ -552,23 +695,30 @@ const HELP = [
     '--vfs-write-back (по умолчанию 5 с) откладывает загрузку записанных файлов в облако: файл локально виден сразу, в облаке появится позже. Это нормально.',
     '--network-mode показывает диск как сетевой. Определение типа в программе от этого не зависит: тип задаётся вручную у пути.',
     'Облако Mega (по документации rclone) различает регистр имён и допускает несколько файлов с одинаковым именем; дубликаты лечатся командой rclone dedupe. Свойства Terabox (bclone) документированы хуже, поэтому для него тоже выбирайте «Облако».',
-    'sshfs-win: права и владелец файлов через Windows недоступны, поэтому сохранение прав Linux возможно только при прямом SFTP (планируется).',
+    'sshfs-win: права и владелец файлов через Windows недоступны. Если нужны права Linux, подключайте сервер напрямую по SFTP (см. ниже).',
     'Маркер (служебный файл в корне пути, защита от подмены диска) можно отключить отметкой «без маркера» у пути. Для облаков корзину удобно выносить из облака: Trash=work.'] },
   { t: 'Защита данных', l: [
     'Если путь недоступен, не отвечает, потерял маркер или у диска изменился серийный номер, правило приостанавливается и ничего не удаляет.',
     'Если за один проход нужно удалить больше MaxDeletePercent файлов (по умолчанию 50%), проход отменяется.',
     'Свежие файлы (изменённые менее 2 секунд назад) пропускаются до следующего прохода. Копирование идёт через временный файл с проверкой, что исходник не менялся.'] },
+  { t: 'Прямое подключение по SSH/SFTP', p: [
+    'Серверы Linux, Android и т. п. можно синхронизировать без подключения диска: Настройки → Подключения SSH/SFTP → «＋ Подключение» (сервер, порт, пользователь, ключ или пароль), затем «Отпечаток…» и «Проверить». В правилах путь записывается как sftp://имя/папка (отдельный файл и маска тоже работают), его можно выбрать кнопкой «Обзор…» → «Где».'],
+    l: [
+      'К серверу можно подключиться только после подтверждения его отпечатка. Логин и пароль до подтверждения не отправляются; если отпечаток позже изменится, подключение отклоняется (защита от подмены сервера).',
+      'Пароль и парольная фраза ключа хранятся зашифрованно (в Windows средствами системы для вашей учётной записи) и нигде не показываются. Другие способы входа (агент ключей) пока не поддерживаются.',
+      'SFTP-путь — сетевой: слежения за событиями нет, сервер проверяется по таймеру (scan, по умолчанию 120 с), при обрыве связи правило ждёт и ничего не удаляет. Время изменения на сервере хранится с точностью до секунды (допуск mtimetol по умолчанию 2 с).',
+      'Корзина по умолчанию создаётся на самом сервере (папка .LocalSyncTrash внутри пути); Trash=work переносит её на этот компьютер.'] },
+  { t: 'Права и владелец на Linux', p: ['При замене файла на SFTP-сервере новый файл получает те же права и владельца, что были у заменяемого (исполняемый остаётся исполняемым); новые файлы между Linux-путями получают права источника. Если файл когда-то побывал на Linux-стороне, права запоминаются и применяются при обновлении через Windows. Смена владельца возможна только при входе под root (иначе применяются только права).'] },
   { t: 'Имена, отличающиеся только регистром', p: [
     'Сейчас: если в одной папке лежат файлы, которые различаются только регистром (на Linux, в облаке Mega), программа их пропускает и пишет предупреждение: Windows не различает такие имена при открытии, и можно перезаписать не тот файл. Остальные файлы синхронизируются.',
-    'Планируется (при прямом SFTP, где доступ к файлам точный). Схема меток для копирования Linux → Windows, программа будет понимать её и в обратную сторону, и для других Linux/Android-устройств:'],
+    'Планируется в версии 0.7.1 (на основе прямого SFTP, где доступ к файлам точный). Схема меток для копирования Linux → Windows; программа будет понимать её и в обратную сторону, и для других Linux/Android-устройств:'],
     l: ['Файл, отличающийся регистром от другого: file.ext, File.ext, FILE.ext, fIlE.ext → на Windows file.ext, File[linux_case].ext, FILE[linux_case].ext, fIlE[linux_case].ext.',
       'Отличается только расширение: another_file.ext, another_file.EXT, another_file.Ext → another_file.ext, another_file.EXT.ext, another_file.Ext.ext.',
       'Метка нужна только при совпадении имён без учёта регистра; обычные файлы (README.md) метки не получают. При обратной синхронизации Windows → Linux метки распознаются и убираются.'] },
-  { t: 'Права и владелец на Linux (планируется)', p: ['При прямом SFTP обновлённый файл будет получать те же права и владельца, что были у заменяемого (например, исполняемый останется исполняемым).'] },
   { t: 'Параметры правила', l: [
     'mode (twoway/oneway), master — режим и главный путь; conflict (auto/ask); TrashDays (число дней, 0 — бессрочно, пусто — без корзины).',
     'scan — период полного сканирования, секунд (0 — выключено); watch — мгновенное слежение; debounce — пауза накопления событий, мс; recursive — вложенные папки.',
-    'remote, cloud — номера путей сетевых/облачных дисков (например cloud=1,3); nomarker — пути без маркера; mtimetol — допуск времени, секунд; timeout — ожидание ответа удалённого диска, секунд.',
+    'sftp://подключение/путь — путь на SSH/SFTP-сервере; remote, cloud — номера путей сетевых/облачных дисков (например cloud=1,3); nomarker — пути без маркера; mtimetol — допуск времени, секунд; timeout — ожидание ответа удалённого диска, секунд.',
     'ignore — маски игнорируемых файлов через «;»; MaxDeletePercent; DeleteExtra; Trash (folder, work или путь); Temp (prefix, work); DirectBelow (КБ); notify; enabled.'] },
   { t: 'Веб-интерфейс', l: [
     'Порт без авторизации (WebPortOpen, по умолчанию 20001, слушает 127.0.0.1) предназначен для доверенных сетей. Любой, кто до него дотянется, может менять правила и просматривать файлы компьютера: закройте его брандмауэром от посторонних.',

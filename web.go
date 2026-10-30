@@ -6,8 +6,10 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -356,6 +358,9 @@ func (w *WebServer) handler(open bool) http.Handler {
 	mux.HandleFunc("GET /api/log", guard(w.apiLog))
 	mux.HandleFunc("GET /api/logfile", guard(w.apiLogFile))
 	mux.HandleFunc("GET /api/fs", guard(w.apiFS))
+	mux.HandleFunc("POST /api/secret", guard(w.apiSecret))
+	mux.HandleFunc("POST /api/conn/probe", guard(w.apiConnProbe))
+	mux.HandleFunc("POST /api/conn/test", guard(w.apiConnTest))
 	mux.HandleFunc("GET /api/config", guard(w.apiConfigGet))
 	mux.HandleFunc("POST /api/config", guard(w.apiConfigSave))
 	mux.HandleFunc("POST /api/credentials", guard(func(rw http.ResponseWriter, r *http.Request) { w.apiCredentials(rw, r, open) }))
@@ -522,7 +527,20 @@ func (w *WebServer) apiLogFile(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *WebServer) apiFS(rw http.ResponseWriter, r *http.Request) {
-	resp, err := fsList(r.URL.Query().Get("path"))
+	q := r.URL.Query()
+	var resp *fsResp
+	var err error
+	if name := q.Get("conn"); name != "" {
+		f, done, ferr := w.connFS(name)
+		if ferr != nil {
+			jerr(rw, 400, "%v", ferr)
+			return
+		}
+		defer done()
+		resp, err = fsListFS(f, q.Get("path"))
+	} else {
+		resp, err = fsList(q.Get("path"))
+	}
 	if err != nil {
 		jerr(rw, 400, "%v", err)
 		return
@@ -531,6 +549,122 @@ func (w *WebServer) apiFS(rw http.ResponseWriter, r *http.Request) {
 		resp.Entries = []fsEntry{}
 	}
 	writeJSON(rw, 200, resp)
+}
+
+// connFS возвращает файловую систему подключения: работающую в движке или, если конфиг только что
+// сохранён и ещё не применён, временную по данным из ini.
+func (w *WebServer) connFS(name string) (FileFS, func(), error) {
+	cn, err := w.connFromINI(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	if f, gerr := w.en.cm.Get(name); gerr == nil && w.en.cm.sig(name) == cn.sig() {
+		return f, func() {}, nil
+	}
+	f := newSFTPFS(*cn, w.en.cm.secrets)
+	return f, f.Close, nil
+}
+
+func (w *WebServer) connFromINI(name string) (*Connection, error) {
+	data, err := os.ReadFile(w.iniPath)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := ParseConfigText(string(data))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Validate()
+	cn := cfg.ConnByName(name)
+	if cn == nil {
+		return nil, fmt.Errorf("подключение %q не найдено", name)
+	}
+	if cn.Err != "" {
+		return nil, fmt.Errorf("подключение %q: %s", name, cn.Err)
+	}
+	return cn, nil
+}
+
+func (w *WebServer) apiSecret(rw http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Conn  string `json:"conn"`
+		Kind  string `json:"kind"`
+		Value string `json:"value"`
+	}
+	if !readJSON(rw, r, &in) {
+		return
+	}
+	if in.Kind != "password" && in.Kind != "passphrase" {
+		jerr(rw, 400, "kind: password или passphrase")
+		return
+	}
+	if _, err := w.connFromINI(in.Conn); err != nil {
+		jerr(rw, 404, "%v", err)
+		return
+	}
+	if err := w.en.cm.secrets.Set(secretKey(in.Conn, in.Kind), in.Value); err != nil {
+		jerr(rw, 500, "не удалось сохранить: %v", err)
+		return
+	}
+	// подключение должно подхватить новый секрет
+	if f, err := w.en.cm.Get(in.Conn); err == nil {
+		if s, ok := f.(*sftpFS); ok {
+			s.Close()
+		}
+	}
+	writeJSON(rw, 200, map[string]any{"ok": true})
+}
+
+// apiConnProbe показывает отпечаток сервера, не отправляя ему логин и пароль.
+func (w *WebServer) apiConnProbe(rw http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	if !readJSON(rw, r, &in) {
+		return
+	}
+	cn, err := w.connFromINI(in.Name)
+	if err != nil {
+		jerr(rw, 404, "%v", err)
+		return
+	}
+	fp, err := probeFingerprint(*cn)
+	if err != nil {
+		jerr(rw, 502, "сервер не ответил: %v", err)
+		return
+	}
+	writeJSON(rw, 200, map[string]any{"fingerprint": fp, "current": cn.HostKey, "trusted": cn.HostKey != "" && cn.HostKey == fp})
+}
+
+// apiConnTest проверяет вход и чтение корневой папки (только к серверу с подтверждённым отпечатком).
+func (w *WebServer) apiConnTest(rw http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	if !readJSON(rw, r, &in) {
+		return
+	}
+	cn, err := w.connFromINI(in.Name)
+	if err != nil {
+		jerr(rw, 404, "%v", err)
+		return
+	}
+	f := newSFTPFS(*cn, w.en.cm.secrets)
+	defer f.Close()
+	var ents []fs.DirEntry
+	if _, err = f.Stat("/"); err == nil {
+		ents, err = f.ReadDir("/")
+	}
+	if err != nil {
+		var hk *HostKeyError
+		out := map[string]any{"error": err.Error()}
+		if errors.As(err, &hk) {
+			out["fingerprint"] = hk.Fingerprint
+		}
+		writeJSON(rw, 502, out)
+		return
+	}
+	writeJSON(rw, 200, map[string]any{"ok": true, "entries": len(ents)})
 }
 
 // ---------- конфигурация ----------
@@ -543,11 +677,26 @@ type apiRuleCfg struct {
 	Err   string   `json:"err,omitempty"`
 }
 
+type apiConn struct {
+	Name          string `json:"name"`
+	Desc          string `json:"desc"`
+	Host          string `json:"host"`
+	Port          int    `json:"port"`
+	User          string `json:"user"`
+	Auth          string `json:"auth"`
+	KeyFile       string `json:"keyfile"`
+	HostKey       string `json:"hostkey"`
+	HasPassword   bool   `json:"hasPassword"`
+	HasPassphrase bool   `json:"hasPassphrase"`
+	Err           string `json:"err,omitempty"`
+}
+
 type apiConfig struct {
-	Rev      string       `json:"rev"`
-	Settings []KV         `json:"settings"`
-	Rules    []apiRuleCfg `json:"rules"`
-	Warnings []string     `json:"warnings,omitempty"`
+	Rev         string       `json:"rev"`
+	Settings    []KV         `json:"settings"`
+	Connections []apiConn    `json:"connections"`
+	Rules       []apiRuleCfg `json:"rules"`
+	Warnings    []string     `json:"warnings,omitempty"`
 }
 
 func revOf(b []byte) string {
@@ -567,7 +716,13 @@ func (w *WebServer) apiConfigGet(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.Validate()
-	out := apiConfig{Rev: revOf(data), Settings: []KV{}, Rules: []apiRuleCfg{}, Warnings: cfg.Warnings}
+	out := apiConfig{Rev: revOf(data), Settings: []KV{}, Connections: []apiConn{}, Rules: []apiRuleCfg{}, Warnings: cfg.Warnings}
+	for _, cn := range cfg.Conns {
+		sec := w.en.cm.secrets
+		out.Connections = append(out.Connections, apiConn{Name: cn.Name, Desc: cn.Desc, Host: cn.Host, Port: cn.Port, User: cn.User, Auth: cn.Auth,
+			KeyFile: cn.KeyFile, HostKey: cn.HostKey, HasPassword: sec.Has(secretKey(cn.Name, "password")),
+			HasPassphrase: sec.Has(secretKey(cn.Name, "passphrase")), Err: cn.Err})
+	}
 	for _, k := range cfg.SettingsOrder {
 		out.Settings = append(out.Settings, KV{k, cfg.Settings[k]})
 	}
@@ -621,6 +776,44 @@ func (w *WebServer) apiConfigSave(rw http.ResponseWriter, r *http.Request) {
 			sk.SettingsOrder = append(sk.SettingsOrder, k)
 		}
 		sk.Settings[k] = strings.TrimSpace(kv.V)
+	}
+	cseen := map[string]bool{}
+	if in.Connections == nil && old != nil { // клиент не прислал подключения — оставляем прежние
+		for _, oc := range old.Conns {
+			in.Connections = append(in.Connections, apiConn{Name: oc.Name, Desc: oc.Desc, Host: oc.Host, Port: oc.Port, User: oc.User, Auth: oc.Auth, KeyFile: oc.KeyFile, HostKey: oc.HostKey})
+		}
+	}
+	for _, ac := range in.Connections {
+		name := strings.TrimSpace(ac.Name)
+		switch {
+		case name == "" || len(name) > 64 || strings.ContainsAny(name, "[]/\\\r\n"):
+			errs = append(errs, fmt.Sprintf("подключение %q: имя не должно быть пустым или содержать [ ] / \\", name))
+			continue
+		case cseen[strings.ToLower(name)]:
+			errs = append(errs, fmt.Sprintf("имя подключения повторяется: %s", name))
+			continue
+		}
+		cseen[strings.ToLower(name)] = true
+		cn := &Connection{Name: name, Desc: strings.TrimSpace(ac.Desc)}
+		if !noNewline(cn.Desc) || !noNewline(ac.Host) || !noNewline(ac.User) || !noNewline(ac.KeyFile) || !noNewline(ac.HostKey) {
+			errs = append(errs, fmt.Sprintf("подключение %s: значения не должны содержать переводов строк", name))
+			continue
+		}
+		cn.set("host", strings.TrimSpace(ac.Host))
+		if ac.Port != 0 && ac.Port != 22 {
+			cn.set("port", strconv.Itoa(ac.Port))
+		}
+		cn.set("user", strings.TrimSpace(ac.User))
+		if ac.Auth != "" {
+			cn.set("auth", ac.Auth)
+		}
+		if ac.KeyFile != "" {
+			cn.set("keyfile", strings.TrimSpace(ac.KeyFile))
+		}
+		if ac.HostKey != "" {
+			cn.set("hostkey", strings.TrimSpace(ac.HostKey))
+		}
+		sk.Conns = append(sk.Conns, cn)
 	}
 	seen := map[string]bool{}
 	for _, ar := range in.Rules {
@@ -677,6 +870,11 @@ func (w *WebServer) apiConfigSave(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg2.Validate()
+	for _, cn := range cfg2.Conns {
+		if cn.Err != "" {
+			errs = append(errs, fmt.Sprintf("подключение %s: %s", cn.Name, cn.Err))
+		}
+	}
 	for _, ru := range cfg2.Rules {
 		if ru.Err != "" {
 			errs = append(errs, fmt.Sprintf("[%s]: %s", ru.Name, ru.Err))
@@ -701,6 +899,13 @@ func (w *WebServer) apiConfigSave(rw http.ResponseWriter, r *http.Request) {
 	if err := os.Rename(tmp, w.iniPath); err != nil {
 		jerr(rw, 500, "не удалось заменить конфиг: %v", err)
 		return
+	}
+	if old != nil { // секреты удалённых подключений не оставляем
+		for _, oc := range old.Conns {
+			if !cseen[strings.ToLower(oc.Name)] {
+				w.en.cm.secrets.DeleteConn(oc.Name)
+			}
+		}
 	}
 	w.en.logf("web", "INFO", "конфиг сохранён через веб-интерфейс (правил: %d), копия прежнего — %s.bak", len(cfg2.Rules), w.iniPath)
 	if w.reload != nil {

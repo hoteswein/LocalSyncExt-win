@@ -4,17 +4,20 @@ import (
 	"bufio"
 	"fmt"
 	"hash/crc32"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // Строка-путь: "C:\..." или "C:/..." или UNC "\\..." или "/..." (для тестов на Linux).
-var pathLineRe = regexp.MustCompile(`^([A-Za-z]:[\\/]|\\\\|/)`)
+var pathLineRe = regexp.MustCompile(`(?i)^([A-Za-z]:[\\/]|\\\\|/|sftp://)`)
 
 // Игнорируется всегда (имена в нижнем регистре, маски path.Match).
 var defaultIgnore = []string{
@@ -24,9 +27,49 @@ var defaultIgnore = []string{
 
 type Endpoint struct {
 	Raw  string // как записано в конфиге
-	Dir  string // папка (для файла — родительская)
+	Dir  string // папка (для файла — родительская) в нотации файловой системы пути
 	Mask string // маска файлов, если путь вида C:\Docs\*.pdf
 	File string // имя файла, если правило в файловом режиме
+	Conn string // имя SSH/SFTP-подключения ("" — локальный диск)
+	FS   FileFS // файловая система пути (подставляется движком перед проходом)
+}
+
+// parse разбирает строку пути: локальный путь Windows или sftp://подключение/путь.
+func (e *Endpoint) parse() {
+	e.Mask, e.File, e.Conn = "", "", ""
+	if len(e.Raw) >= 7 && strings.EqualFold(e.Raw[:7], "sftp://") {
+		name, p, _ := strings.Cut(e.Raw[7:], "/")
+		e.Conn = name
+		p = path.Clean("/" + p)
+		e.Dir = p
+		if base := path.Base(p); strings.ContainsAny(base, "*?") {
+			e.Mask, e.Dir = base, path.Dir(p)
+		}
+		return
+	}
+	p := filepath.Clean(e.Raw)
+	e.Dir = p
+	if base := filepath.Base(p); strings.ContainsAny(base, "*?") {
+		e.Mask, e.Dir = base, filepath.Dir(p)
+	}
+}
+
+func statEP(e *Endpoint) (fs.FileInfo, error) {
+	if e.FS != nil {
+		return e.FS.Stat(e.Dir)
+	}
+	if e.Conn != "" {
+		return nil, fs.ErrNotExist
+	}
+	return os.Stat(e.Dir)
+}
+
+func (e *Endpoint) splitFile() {
+	if e.Conn != "" {
+		e.File, e.Dir = path.Base(e.Dir), path.Dir(e.Dir)
+		return
+	}
+	e.File, e.Dir = filepath.Base(e.Dir), filepath.Dir(e.Dir)
 }
 
 type Rule struct {
@@ -55,6 +98,7 @@ type Rule struct {
 	TempMode     string       // prefix | work ("" — из [Settings])
 	DirectKB     int          // файлы не больше этого размера пишутся сразу, без временного файла (-1 — из [Settings])
 	workDir      string
+	attrWarned   atomic.Bool
 	Desc         string // аннотация (ключ description)
 	Explicit     []KV   // явно заданные опции в порядке файла
 	Endpoints    []*Endpoint
@@ -71,6 +115,7 @@ type KV struct {
 }
 
 type Config struct {
+	Conns         []*Connection
 	WorkDir       string
 	Header        []string // комментарии в начале файла
 	SettingsOrder []string
@@ -257,6 +302,7 @@ func ParseConfigText(text string) (*Config, error) {
 	text = strings.TrimPrefix(text, "\ufeff")
 	cfg := &Config{Settings: map[string]string{}}
 	var cur *Rule
+	var conn *Connection
 	inSettings := false
 	started := false // встретилась ли первая секция или строка настройки
 	sc := bufio.NewScanner(strings.NewReader(text))
@@ -277,16 +323,27 @@ func ParseConfigText(text string) (*Config, error) {
 		started = true
 		if line[0] == '[' && line[len(line)-1] == ']' {
 			name := strings.TrimSpace(line[1 : len(line)-1])
+			conn = nil
 			if strings.EqualFold(name, "settings") {
 				inSettings, cur = true, nil
 				continue
 			}
 			inSettings = false
+			if len(name) > 11 && strings.EqualFold(name[:11], "connection ") {
+				cur = nil
+				conn = &Connection{Name: strings.TrimSpace(name[11:]), Port: 22}
+				cfg.Conns = append(cfg.Conns, conn)
+				continue
+			}
 			cur = newRule(name)
 			cfg.Rules = append(cfg.Rules, cur)
 			continue
 		}
 		if pathLineRe.MatchString(line) {
+			if conn != nil {
+				warn("путь внутри подключения: %s", line)
+				continue
+			}
 			if cur == nil {
 				warn("путь вне правила: %s", line)
 				continue
@@ -305,6 +362,10 @@ func ParseConfigText(text string) (*Config, error) {
 				cfg.SettingsOrder = append(cfg.SettingsOrder, k)
 			}
 			cfg.Settings[k] = v
+			continue
+		}
+		if conn != nil {
+			conn.set(k, v)
 			continue
 		}
 		if cur == nil {
@@ -339,11 +400,9 @@ func ParseConfigText(text string) (*Config, error) {
 func (r *Rule) prepare() {
 	var masks []string
 	for _, e := range r.Endpoints {
-		p := filepath.Clean(e.Raw)
-		e.Dir, e.Mask, e.File = p, "", ""
-		if base := filepath.Base(p); strings.ContainsAny(base, "*?") {
-			e.Mask, e.Dir = base, filepath.Dir(p)
-			masks = append(masks, strings.ToLower(base))
+		e.parse()
+		if e.Mask != "" {
+			masks = append(masks, strings.ToLower(e.Mask))
 		}
 	}
 	sort.Strings(masks)
@@ -359,7 +418,7 @@ func (r *Rule) prepare() {
 	}
 	files, dirs := 0, 0
 	for _, e := range r.Endpoints {
-		if fi, err := os.Stat(e.Dir); err == nil {
+		if fi, err := statEP(e); err == nil {
 			if fi.IsDir() {
 				dirs++
 			} else {
@@ -374,7 +433,7 @@ func (r *Rule) prepare() {
 	if files > 0 {
 		r.FileMode = true
 		for _, e := range r.Endpoints {
-			e.File, e.Dir = filepath.Base(e.Dir), filepath.Dir(e.Dir)
+			e.splitFile()
 		}
 	}
 }
@@ -383,10 +442,20 @@ func lowerClean(p string) string { return strings.ToLower(filepath.Clean(p)) }
 
 func under(child, parent string) bool {
 	sep := string(filepath.Separator)
+	if strings.HasPrefix(child, "sftp://") {
+		sep = "/"
+	}
 	return strings.HasPrefix(child+sep, parent+sep)
 }
 
 func fullPath(e *Endpoint) string {
+	if e.Conn != "" {
+		p := e.Dir
+		if e.File != "" {
+			p = path.Join(p, e.File)
+		}
+		return "sftp://" + strings.ToLower(e.Conn) + path.Clean(p)
+	}
 	if e.File != "" {
 		return lowerClean(filepath.Join(e.Dir, e.File))
 	}
@@ -394,6 +463,9 @@ func fullPath(e *Endpoint) string {
 }
 
 func epOverlap(a, b *Endpoint) bool {
+	if (a.Conn == "") != (b.Conn == "") || !strings.EqualFold(a.Conn, b.Conn) {
+		return false
+	}
 	pa, pb := fullPath(a), fullPath(b)
 	return under(pa, pb) || under(pb, pa)
 }
@@ -415,6 +487,15 @@ func disjointMasks(a, b *Rule) bool {
 // Validate проверяет правила: минимум 2 пути, пересечения, дубликаты имён.
 // Некорректные правила получают Err и не запускаются; остальные работают.
 func (c *Config) Validate() {
+	cseen := map[string]bool{}
+	for _, cn := range c.Conns {
+		cn.finish()
+		if k := strings.ToLower(cn.Name); cseen[k] {
+			cn.fail("повторяющееся имя подключения")
+		} else {
+			cseen[k] = true
+		}
+	}
 	seen := map[string]bool{}
 	for _, r := range c.Rules {
 		key := strings.ToLower(r.Name)
@@ -429,6 +510,17 @@ func (c *Config) Validate() {
 			r.fail("master=%d, но путей только %d", r.Master+1, len(r.Endpoints))
 		}
 		r.checkWorkPlaces(c)
+		for _, e := range r.Endpoints {
+			e.parse()
+			if e.Conn == "" {
+				continue
+			}
+			if cn := c.ConnByName(e.Conn); cn == nil {
+				r.fail("подключение %q не найдено (раздел [Connection %s])", e.Conn, e.Conn)
+			} else if cn.Err != "" {
+				r.fail("подключение %q с ошибкой: %s", e.Conn, cn.Err)
+			}
+		}
 		for i := range r.NoMarker {
 			if i >= len(r.Endpoints) {
 				r.fail("nomarker: пути №%d нет в правиле", i+1)
@@ -532,15 +624,16 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// trashRoot — где лежит корзина для пути №i (с 0).
-func (r *Rule) trashRoot(i int) string {
+// trashRoot — файловая система и папка корзины для пути №i (с 0).
+func (r *Rule) trashRoot(i int) (FileFS, string) {
+	e := r.Endpoints[i]
 	switch r.TrashPlace {
 	case "folder", "":
-		return filepath.Join(r.Endpoints[i].Dir, trashDir)
+		return e.FS, e.FS.Join(e.Dir, trashDir)
 	case "work":
-		return filepath.Join(r.workDir, "trash", safeName(r.Name), fmt.Sprintf("ep%d", i+1))
+		return theLocalFS, filepath.Join(r.workDir, "trash", safeName(r.Name), fmt.Sprintf("ep%d", i+1))
 	}
-	return filepath.Join(r.TrashPlace, safeName(r.Name), fmt.Sprintf("ep%d", i+1))
+	return theLocalFS, filepath.Join(r.TrashPlace, safeName(r.Name), fmt.Sprintf("ep%d", i+1))
 }
 
 // checkWorkPlaces: корзина/временные файлы вне папок не должны попадать внутрь синхронизируемых путей.
@@ -560,6 +653,9 @@ func (r *Rule) checkWorkPlaces(c *Config) {
 		lr := lowerClean(root)
 		for _, other := range c.Rules {
 			for _, e := range other.Endpoints {
+				if len(e.Raw) >= 7 && strings.EqualFold(e.Raw[:7], "sftp://") {
+					continue
+				}
 				ep := lowerClean(filepath.Dir(e.Raw))
 				if !strings.ContainsAny(filepath.Base(e.Raw), "*?") {
 					ep = lowerClean(e.Raw)
@@ -633,6 +729,16 @@ func (c *Config) Render() string {
 		}
 		b.WriteString("\n")
 	}
+	for _, cn := range c.Conns {
+		fmt.Fprintf(&b, "[Connection %s]\n", cn.Name)
+		if cn.Desc != "" {
+			fmt.Fprintf(&b, "description=%s\n", cn.Desc)
+		}
+		for _, kv := range cn.Explicit {
+			fmt.Fprintf(&b, "%s=%s\n", kv.K, kv.V)
+		}
+		b.WriteString("\n")
+	}
 	for _, r := range c.Rules {
 		fmt.Fprintf(&b, "[%s]\n", r.Name)
 		if r.Desc != "" {
@@ -651,6 +757,9 @@ func (c *Config) Render() string {
 
 // kind — тип пути №i: local, remote (сетевой диск) или cloud (облако через rclone mount).
 func (r *Rule) kind(i int) string {
+	if i < len(r.Endpoints) && (r.Endpoints[i].Conn != "" || (len(r.Endpoints[i].Raw) >= 7 && strings.EqualFold(r.Endpoints[i].Raw[:7], "sftp://"))) {
+		return "remote"
+	}
 	switch {
 	case r.Cloud[i]:
 		return "cloud"
@@ -686,4 +795,86 @@ func (r *Rule) op(i int, fn func() error) error {
 		return guardOp(d, fn)
 	}
 	return fn()
+}
+
+func (c *Connection) fail(format string, a ...any) {
+	if c.Err == "" {
+		c.Err = fmt.Sprintf(format, a...)
+	}
+}
+
+func (c *Connection) record(k, v string) {
+	for i := range c.Explicit {
+		if c.Explicit[i].K == k {
+			c.Explicit[i].V = v
+			return
+		}
+	}
+	c.Explicit = append(c.Explicit, KV{k, v})
+}
+
+func (c *Connection) set(k, v string) {
+	if k != "description" && k != "desc" {
+		c.record(k, v)
+	}
+	switch k {
+	case "description", "desc":
+		c.Desc = v
+	case "host":
+		c.Host = v
+	case "port":
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 65535 {
+			c.fail("port=%q: нужен порт 1..65535", v)
+			return
+		}
+		c.Port = n
+	case "user":
+		c.User = v
+	case "auth":
+		v = strings.ToLower(v)
+		if v != "key" && v != "password" {
+			c.fail("auth=%q: допустимо key или password", v)
+			return
+		}
+		c.Auth = v
+	case "keyfile":
+		c.KeyFile = v
+	case "hostkey":
+		c.HostKey = v
+	default:
+		c.fail("неизвестная опция %q", k)
+	}
+}
+
+// finish проверяет подключение после разбора файла.
+func (c *Connection) finish() {
+	if c.Auth == "" {
+		c.Auth = "password"
+		if c.KeyFile != "" {
+			c.Auth = "key"
+		}
+	}
+	if c.Host == "" {
+		c.fail("не указан host")
+	}
+	if c.User == "" {
+		c.fail("не указан user")
+	}
+	if c.Auth == "key" && c.KeyFile == "" {
+		c.fail("auth=key, но не указан keyfile")
+	}
+	if strings.ContainsAny(c.Name, "/\\") || c.Name == "" {
+		c.fail("недопустимое имя подключения")
+	}
+}
+
+// ConnByName возвращает подключение по имени (без учёта регистра).
+func (c *Config) ConnByName(name string) *Connection {
+	for _, x := range c.Conns {
+		if strings.EqualFold(x.Name, name) {
+			return x
+		}
+	}
+	return nil
 }
