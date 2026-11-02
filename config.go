@@ -99,6 +99,7 @@ type Rule struct {
 	DirectKB     int          // файлы не больше этого размера пишутся сразу, без временного файла (-1 — из [Settings])
 	workDir      string
 	attrWarned   atomic.Bool
+	caseMode     string // fold | exact | mapped (см. casemap.go)
 	Desc         string // аннотация (ключ description)
 	Explicit     []KV   // явно заданные опции в порядке файла
 	Endpoints    []*Endpoint

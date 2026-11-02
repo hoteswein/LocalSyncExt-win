@@ -44,9 +44,10 @@ type FInfo struct {
 
 // epCache — известное содержимое пути (в памяти), чтобы по событию проверять только изменённое.
 type epCache struct {
-	files map[string]FInfo    // ключ (нижний регистр, '/') -> файл
-	dirs  map[string]string   // ключ папки -> относительный путь
-	coll  map[string][]string // ключи, под которые попали файлы, отличающиеся только регистром
+	files   map[string]FInfo    // ключ файла -> файл
+	dirs    map[string]string   // ключ папки -> относительный путь
+	coll    map[string][]string // ключи, под которые попали файлы, отличающиеся только регистром
+	collDir map[string][]string // ключи папок, отличающихся только регистром
 }
 
 type rawEv struct {
@@ -82,6 +83,7 @@ type ruleRT struct {
 	st          *State
 	cache       []*epCache
 	pend        map[string]string // ключи для повторной проверки (файл ещё пишется / ошибка)
+	caseIdx     caseIndex         // группы имён, различающихся регистром (режим mapped)
 }
 
 func newRT() *ruleRT {
@@ -722,6 +724,7 @@ func (en *Engine) pass(r *Rule, rt *ruleRT, full bool, raws []rawEv, force bool)
 		return 0, aerr
 	}
 	r.prepare() // теперь можно определить, файл это или папка, и на SFTP-путях
+	r.detectCaseMode()
 	if r.Err != "" {
 		return 0, errors.New(r.Err)
 	}
@@ -770,6 +773,7 @@ func (en *Engine) pass(r *Rule, rt *ruleRT, full bool, raws []rawEv, force bool)
 		}
 	}
 
+	en.reconcileNames(r, rt)
 	now := time.Now()
 	scans := make([]map[string]FInfo, n)
 	for i := range scans {
@@ -1034,7 +1038,7 @@ func isHot(mtime int64, now time.Time) bool {
 }
 
 func newCache() *epCache {
-	return &epCache{files: map[string]FInfo{}, dirs: map[string]string{}, coll: map[string][]string{}}
+	return &epCache{files: map[string]FInfo{}, dirs: map[string]string{}, coll: map[string][]string{}, collDir: map[string][]string{}}
 }
 
 func relKey(rel string) string { return strings.ToLower(filepath.ToSlash(rel)) }
@@ -1043,7 +1047,7 @@ func relKey(rel string) string { return strings.ToLower(filepath.ToSlash(rel)) }
 func scanGuarded(r *Rule, i int, e *Endpoint) (*epCache, error) {
 	stall := r.stall(i)
 	if stall == 0 {
-		return scanEndpoint(r, e, nil)
+		return scanEndpoint(r, i, e, nil)
 	}
 	type res struct {
 		c   *epCache
@@ -1052,7 +1056,7 @@ func scanGuarded(r *Rule, i int, e *Endpoint) (*epCache, error) {
 	var prog atomic.Int64
 	done := make(chan res, 1)
 	go func() {
-		c, err := scanEndpoint(r, e, &prog)
+		c, err := scanEndpoint(r, i, e, &prog)
 		done <- res{c, err}
 	}()
 	last, lastT := int64(-1), time.Now()
@@ -1072,8 +1076,9 @@ func scanGuarded(r *Rule, i int, e *Endpoint) (*epCache, error) {
 	}
 }
 
-func scanEndpoint(r *Rule, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
+func scanEndpoint(r *Rule, ci int, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
 	c := newCache()
+	physSeen := map[string]string{}
 	if r.FileMode {
 		fi, err := e.FS.Lstat(e.FS.Join(e.Dir, e.File))
 		if errors.Is(err, fs.ErrNotExist) {
@@ -1109,7 +1114,11 @@ func scanEndpoint(r *Rule, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
 				return fs.SkipDir
 			}
 			rel, _ := e.FS.RelSlash(root, p)
-			c.dirs[relKey(rel)] = rel
+			dk := r.dirKey(rel)
+			if prev, ok := c.dirs[dk]; ok && prev != rel && r.caseMode == "mapped" {
+				c.collDir[dk] = append(c.collDir[dk], prev, rel)
+			}
+			c.dirs[dk] = rel
 			return nil
 		}
 		if d.Type().IsRegular() && tempNameRe.MatchString(name) {
@@ -1130,7 +1139,17 @@ func scanEndpoint(r *Rule, e *Endpoint, prog *atomic.Int64) (*epCache, error) {
 			return ierr
 		}
 		rel, _ := e.FS.RelSlash(root, p)
-		key := strings.ToLower(rel)
+		key := r.keyOf(r.logical(ci, rel))
+		if r.caseMode == "mapped" && !e.FS.CaseSensitive() {
+			// диск без учёта регистра (в том числе смонтированный облачный) показал имена, отличающиеся регистром
+			pk := strings.ToLower(rel)
+			if prevRel, seen := physSeen[pk]; seen {
+				pkey := r.keyOf(r.logical(ci, prevRel))
+				c.coll[pkey] = append(c.coll[pkey], prevRel)
+				c.coll[key] = append(c.coll[key], rel)
+			}
+			physSeen[pk] = rel
+		}
 		if prev, dup := c.files[key]; dup {
 			if len(c.coll[key]) == 0 {
 				c.coll[key] = []string{prev.Rel}
@@ -1171,6 +1190,8 @@ func (en *Engine) refreshKeys(r *Rule, rt *ruleRT, keys map[string]string) error
 			use := rel
 			if old, ok := c.files[key]; ok {
 				use = old.Rel
+			} else {
+				use = r.relFor(rt, i, key, rel)
 			}
 			fi, ok, err := statEntry(r, e, use)
 			if err != nil {
@@ -1202,7 +1223,7 @@ func (en *Engine) resolveEvents(r *Rule, rt *ruleRT, raws []rawEv, out map[strin
 			continue
 		}
 		rel := filepath.ToSlash(ev.rel)
-		lrel := strings.ToLower(rel)
+		lrel := r.dirKey(rel)
 		if !r.Recursive && strings.Contains(rel, "/") {
 			continue
 		}
@@ -1216,7 +1237,7 @@ func (en *Engine) resolveEvents(r *Rule, rt *ruleRT, raws []rawEv, out map[strin
 			prefix := lrel + "/"
 			for k, fi := range c.files {
 				if strings.HasPrefix(k, prefix) {
-					out[k] = fi.Rel
+					out[k] = r.logical(ev.ep, fi.Rel)
 				}
 			}
 		}
@@ -1232,29 +1253,32 @@ func (en *Engine) resolveEvents(r *Rule, rt *ruleRT, raws []rawEv, out map[strin
 					}
 				}
 			} else {
-				out[lrel] = rel
+				lr := r.logical(ev.ep, rel)
+				out[r.keyOf(lr)] = lr
 			}
 		case err != nil:
 			return err
 		case fi.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0:
-			out[lrel] = rel
+			lr := r.logical(ev.ep, rel)
+			out[r.keyOf(lr)] = lr
 		case fi.IsDir():
 			if !r.Recursive {
 				continue
 			}
 			c.dirs[lrel] = rel
-			if werr := walkNew(r, e, c, rel, out); werr != nil {
+			if werr := walkNew(r, ev.ep, e, c, rel, out); werr != nil {
 				return werr
 			}
 		default:
-			out[lrel] = rel
+			lr := r.logical(ev.ep, rel)
+			out[r.keyOf(lr)] = lr
 		}
 	}
 	return nil
 }
 
 // walkNew обходит появившуюся (или переименованную) папку и помечает файлы в ней изменёнными.
-func walkNew(r *Rule, e *Endpoint, c *epCache, rel string, out map[string]string) error {
+func walkNew(r *Rule, ci int, e *Endpoint, c *epCache, rel string, out map[string]string) error {
 	root := filepath.Join(e.Dir, filepath.FromSlash(rel))
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
@@ -1272,11 +1296,12 @@ func walkNew(r *Rule, e *Endpoint, c *epCache, rel string, out map[string]string
 			if ignored(r, d.Name()) {
 				return fs.SkipDir
 			}
-			c.dirs[strings.ToLower(x)] = x
+			c.dirs[r.dirKey(x)] = x
 			return nil
 		}
 		if !ignored(r, d.Name()) {
-			out[strings.ToLower(x)] = x
+			lx := r.logical(ci, x)
+			out[r.keyOf(lx)] = lx
 		}
 		return nil
 	})
@@ -1368,7 +1393,7 @@ func (en *Engine) planTwoWay(r *Rule, st *State, scans []map[string]FInfo, joini
 			if fi, ok := scans[i][key]; ok {
 				f := fi
 				cur[i] = &f
-				rel = f.Rel
+				rel = r.logical(i, f.Rel)
 				hot = hot || isHot(f.MTime, now)
 			}
 		}
@@ -1444,7 +1469,7 @@ func (en *Engine) planTwoWay(r *Rule, st *State, scans []map[string]FInfo, joini
 				w = i
 			}
 		}
-		j := &job{key: key, rel: cur[w].Rel, winner: w, wi: *cur[w]}
+		j := &job{key: key, rel: r.logical(w, cur[w].Rel), winner: w, wi: *cur[w]}
 		if hasBase {
 			j.attr = b.Attr
 		}
@@ -1482,17 +1507,17 @@ func (en *Engine) planOneWay(r *Rule, scans []map[string]FInfo, only map[string]
 		mi, mok := scans[m][key]
 		if mok {
 			if isHot(mi.MTime, now) {
-				hotKeys[key] = mi.Rel
+				hotKeys[key] = r.logical(m, mi.Rel)
 				continue
 			}
-			j := &job{key: key, rel: mi.Rel, winner: m, noBase: true}
+			j := &job{key: key, rel: r.logical(m, mi.Rel), winner: m, noBase: true}
 			for i := range scans {
 				if i == m {
 					continue
 				}
 				si, ok := scans[i][key]
 				if ok && isHot(si.MTime, now) {
-					hotKeys[key] = mi.Rel
+					hotKeys[key] = r.logical(m, mi.Rel)
 					continue
 				}
 				if !ok || si.Size != mi.Size || (r.mtimeReliable(i) && r.mtimeReliable(m) && absI64(si.MTime-mi.MTime) > tol) {
@@ -1513,10 +1538,10 @@ func (en *Engine) planOneWay(r *Rule, scans []map[string]FInfo, only map[string]
 			}
 			if si, ok := scans[i][key]; ok {
 				if isHot(si.MTime, now) {
-					hotKeys[key] = si.Rel
+					hotKeys[key] = r.logical(i, si.Rel)
 					continue
 				}
-				jobs = append(jobs, &job{key: key, rel: si.Rel, winner: -1, deletes: []int{i}, noBase: true})
+				jobs = append(jobs, &job{key: key, rel: r.logical(i, si.Rel), winner: -1, deletes: []int{i}, noBase: true})
 			}
 		}
 	}
@@ -1546,10 +1571,12 @@ func (en *Engine) execJob(r *Rule, rt *ruleRT, st *State, scans []map[string]FIn
 		src := r.abs(r.Endpoints[j.winner], wi.Rel)
 		for _, c := range j.copies {
 			e := r.Endpoints[c.dst]
-			rel := wi.Rel
 			old, hadOld := scans[c.dst][j.key]
+			var rel string
 			if hadOld {
 				rel = old.Rel
+			} else {
+				rel = r.relFor(rt, c.dst, j.key, r.logical(j.winner, wi.Rel))
 			}
 			dst := r.abs(e, rel)
 			if c.rename && hadOld {
@@ -1949,19 +1976,37 @@ func (en *Engine) skipCaseCollisions(r *Rule, rt *ruleRT, jobs []*job) []*job {
 			skip[k] = true
 			if !rt.notified["case:"+k] {
 				rt.notified["case:"+k] = true
-				en.logf(r.Name, "WARN", "файлы отличаются только регистром, пропущены: %s (путь №%d). Схема меток [linux_case] появится в следующей версии", strings.Join(rels, " | "), i+1)
+				en.logf(r.Name, "WARN", "файлы отличаются только регистром, пропущены: %s (путь №%d). имена по схеме [linux_case] применяются только когда одна из сторон — Linux (SFTP)", strings.Join(rels, " | "), i+1)
 				en.notify(r, "Конфликт имён", "Файлы отличаются только регистром и пропущены: "+rels[0])
 			}
 		}
 	}
-	if len(skip) == 0 {
+	var skipDirs []string
+	for i, c := range rt.cache {
+		for k, rels := range c.collDir {
+			skipDirs = append(skipDirs, k+"/")
+			if !rt.notified["cased:"+k] {
+				rt.notified["cased:"+k] = true
+				en.logf(r.Name, "WARN", "папки отличаются только регистром, их содержимое пропущено: %s (путь №%d)", strings.Join(rels, " | "), i+1)
+				en.notify(r, "Конфликт имён", "Папки отличаются только регистром и пропущены: "+rels[0])
+			}
+		}
+	}
+	if len(skip) == 0 && len(skipDirs) == 0 {
 		return jobs
 	}
 	out := jobs[:0:0]
+next:
 	for _, j := range jobs {
-		if !skip[j.key] {
-			out = append(out, j)
+		if skip[j.key] {
+			continue
 		}
+		for _, d := range skipDirs {
+			if strings.HasPrefix(j.key, d) {
+				continue next
+			}
+		}
+		out = append(out, j)
 	}
 	return out
 }
