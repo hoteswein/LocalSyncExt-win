@@ -18,7 +18,44 @@ var version = "dev"
 // guiBuild = "1" в сборке без консольного окна (-H=windowsgui): по умолчанию работает значок в трее.
 var guiBuild = ""
 
+const defaultConfig = `; LocalSyncExt — автоматически созданная конфигурация
+; Добавьте правила через веб-панель или вручную в этот файл.
+[Settings]
+WebUI=1
+WebPortOpen=20001
+WebOpenBind=127.0.0.1
+WebPortAuth=0
+`
+
+// ensureConfig создаёт пустую конфигурацию только если файла ещё нет.
+// Исключительное создание защищает существующий файл от перезаписи при гонке запуска.
+func ensureConfig(path string) error {
+	_, err := os.Stat(path)
+	if err == nil {
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if os.IsExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err = f.WriteString(defaultConfig); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	return f.Close()
+}
+
 func loadConfig(path string) (*Config, error) {
+	if err := ensureConfig(path); err != nil {
+		return nil, err
+	}
 	cfg, err := ParseConfig(path)
 	if err != nil {
 		return nil, err

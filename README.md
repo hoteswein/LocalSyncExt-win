@@ -5,6 +5,7 @@
 
 Две сборки: `LocalSyncExt.exe` (трей, без окна консоли) и `LocalSyncExt-cli.exe` (консоль).
 Запуск: `LocalSyncExt-cli.exe [-config путь] [-once] [-dry-run] [-check] [-tray]`
+Если INI отсутствует, программа создаёт его автоматически: без правил и пароля, с веб-панелью на `127.0.0.1:20001` (порт авторизации выключен). Правила можно добавить через веб-панель или вручную.
 
 Опции правила: `mode`, `master`, `conflict`, `notify`, `ignore`, `TrashDays`, `scan`, `recursive`,
 `MaxDeletePercent`, `DeleteExtra`, `watch`, `debounce`, `marker`, `nomarker`, `enabled`.
